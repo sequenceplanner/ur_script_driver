@@ -1,5 +1,5 @@
 [package]
-name = "ur_driver"
+name = "ur_script_driver"
 version = "0.1.0"
 authors = ["endre90 <endre90@gmail.com>"]
 edition = "2018"
@@ -7,9 +7,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "0.2", features = ["full"] }
-tokio-util = { version = "0.3.1", features = ["codec"] }
-r2r = { git = "https://github.com/sequenceplanner/r2r" }
+tokio = { version = "1", features = ["full"] }
+r2r = { git = "https://github.com/sequenceplanner/r2r", version = "0.1.0" }
+# r2r = { path = "/Users/martin/r2r/r2r", version = "0.1.0" }
 failure = "0.1.5"
 failure_derive = "0.1.5"
 futures = "0.3.5"
@@ -17,3 +17,7 @@ bytes = "0.5.4"
 hex = "0.4.2"
 lazy_static = "1.4.0"
 snailquote = "0.3.0"
+
+# speed up compilation
+[profile.release]
+opt-level = 0 # defaults to 3.
