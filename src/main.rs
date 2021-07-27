@@ -64,10 +64,9 @@ async fn ur_reader(
     dashboard_commands: mpsc::Sender<(DashBoardCommand, oneshot::Sender<bool>)>,
     joint_publisher: Publisher<sensor_msgs::msg::JointState>,
     robot_publisher: Publisher<std_msgs::msg::String>,
-    ur_address: String,
+    mut stream: tokio::net::tcp::OwnedReadHalf,
     tf_prefix: String,
 ) -> Result<(), std::io::Error> {
-    let mut stream = TcpStream::connect(&ur_address).await?;
     let mut checking_for_1 = false;
     let mut cancelling = false;
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime).unwrap();
@@ -75,8 +74,10 @@ async fn ur_reader(
 
     loop {
         let mut size_bytes = [0u8; 4];
+        println!("reading...");
         stream.read_exact(&mut size_bytes).await.expect("could not read realtime data");
         let msg_size = u32::from_be_bytes(size_bytes) as usize;
+        println!("done reading... {} bytes", msg_size);
 
         // need to subtract the 4 we already read
         let mut buf: Vec<u8> = Vec::new();
@@ -209,12 +210,11 @@ async fn ur_reader(
 
 async fn ur_writer(
     mut recv: mpsc::Receiver<std::string::String>,
-    ur_address: String,
+    mut stream: tokio::net::tcp::OwnedWriteHalf
 ) -> Result<(), std::io::Error> {
     loop {
         let data = recv.recv().await.unwrap();
 
-        let mut stream = TcpStream::connect(&ur_address).await?;
         println!("writing data to driver {}", data);
         stream.write_all(data.as_bytes()).await?;
         stream.flush().await?;
@@ -344,16 +344,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let r_shared_state = shared_state.clone();
+
+    let stream = TcpStream::connect(&ur_address).await?;
+    let (reader, writer) = stream.into_split();
     tokio::spawn(async move {
         let reader = ur_reader(
             r_shared_state,
             tx_dashboard,
             joint_publisher,
             rob_publisher,
-            ur_address.to_owned(),
+            reader,
             tf_prefix.to_owned(),
         );
-        let writer = ur_writer(rx, ur_address.to_owned());
+        let writer = ur_writer(rx, writer);
         let dashboard_writer = dashboard_writer(rx_dashboard, ur_dashboard_address.to_owned());
         tokio::try_join!(reader, writer, dashboard_writer)
     });
