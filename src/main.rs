@@ -105,7 +105,7 @@ async fn realtime(
             }
             _ = stream.read_exact(&mut size_bytes) => {
                 let msg_size = u32::from_be_bytes(size_bytes) as usize;
-                println!("done reading... {} bytes", msg_size);
+                // println!("done reading... {} bytes", msg_size);
 
                 // need to subtract the 4 we already read
                 let mut buf: Vec<u8> = Vec::new();
@@ -136,7 +136,7 @@ async fn realtime(
                     let program_running = driver_state.lock().unwrap().goal.is_some();
 
                     // when we have a goal, first wait until program_state reaches "2'
-                    if program_running && program_state == "2" {
+                    if program_running && program_state == "2" && !checking_for_1 {
                         println!("program started, waiting for finish");
                         checking_for_1 = true;
                     }
@@ -229,8 +229,8 @@ async fn realtime(
                     ticker += 1;
                     if ticker % 1000 == 0 {
                         robot_publisher.publish(&rob_send).unwrap();
-                        println!("robot state {:?}", robot_state);
-                        println!("program state {:?}", program_state);
+                        // println!("robot state {:?}", robot_state);
+                        // println!("program state {:?}", program_state);
                     }
                 }
             }
@@ -304,8 +304,6 @@ async fn dashboard(
                 println!("response to stop command was: {}", response);
             }
         }
-
-
     }
 }
 
