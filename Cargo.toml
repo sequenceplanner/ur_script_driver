@@ -1,7 +1,7 @@
 [package]
 name = "ur_script_driver"
 version = "0.1.0"
-authors = ["endre90 <endre90@gmail.com>"]
+authors = ["Martin Dahl <martin.dahl@gmail.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,9 +9,6 @@ edition = "2018"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 r2r = { git = "https://github.com/sequenceplanner/r2r", version = "0.1.0" }
-# r2r = { path = "/Users/martin/r2r/r2r", version = "0.1.0" }
-failure = "0.1.5"
-failure_derive = "0.1.5"
 futures = "0.3.5"
 bytes = "0.5.4"
 hex = "0.4.2"
