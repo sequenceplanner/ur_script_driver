@@ -98,23 +98,35 @@ async fn realtime(
         tokio::select! {
             data = recv.recv() => {
                 if let Some(data) = data {
-                    println!("writing data to driver {}", data);
-                    stream.write_all(data.as_bytes()).await?;
-                    stream.flush().await?;
+                    println!("making a new connection to the driver.");
+                    let ret = TcpStream::connect(&ur_address).await;
+                    match ret {
+                        Ok(mut write_stream) => {
+                            println!("writing data to driver {}", data);
+                            write_stream.write_all(data.as_bytes()).await?;
+                            write_stream.flush().await?;
+                        },
+                        Err(_) => {
+                            println!("could not connect to realtime port for writing");
+                        }
+                    }
+
                 }
             }
             _ = stream.read_exact(&mut size_bytes) => {
                 let msg_size = u32::from_be_bytes(size_bytes) as usize;
                 // println!("done reading... {} bytes", msg_size);
 
-                // need to subtract the 4 we already read
+                // need to subtract the 4 we already read (msg_size)
                 let mut buf: Vec<u8> = Vec::new();
                 buf.resize(msg_size - 4, 0);
                 stream.read_exact(&mut buf).await?;
 
-                if msg_size == 1116 {
-                    // let time = read_f64(&buf[0..8]);
-                    // println!("t: {:.1}s", time);
+                if msg_size != 1220 {
+                    println!("got unkown frame length: {}", msg_size);
+                }
+                if msg_size == 1220 {
+                    let time = read_f64(&buf[0..8]);
                     let mut joints = vec![];
                     let mut speeds = vec![];
                     for i in 0..6 {
@@ -153,6 +165,7 @@ async fn realtime(
                         {
                             let mut ds = driver_state.lock().unwrap();
                             if let Some(mut goal) = ds.goal.take() {
+                                println!("goal succeeded");
                                 goal.succeed(result_msg).expect("could not set result");
                             } else {
                                 println!("we fininshed but probably canceled the goal before...");
@@ -161,6 +174,19 @@ async fn realtime(
 
                         // just checking...
                         assert!(speeds.iter().all(|x| x.abs() == 0.0));
+                    }
+
+                    if robot_state == "3" {
+                        // robot has entered protective stop. If there is an active goal, abort it.
+                        // we are finished. succeed and remove the action goal handle.
+                        let result_msg = ExecuteScript::Result { ok: false };
+                        {
+                            let mut ds = driver_state.lock().unwrap();
+                            if let Some(mut goal) = ds.goal.take() {
+                                println!("aborting due to protective stop");
+                                goal.abort(result_msg).expect("could not abort goal");
+                            }
+                        }
                     }
 
                     // handle cancel requests
@@ -193,41 +219,44 @@ async fn realtime(
                         cancelling = false;
                     }
 
-                    let rob_send = std_msgs::msg::String {
-                        data: if robot_state == "1" {
-                            "normal".to_owned()
-                        } else if robot_state == "3" {
-                            "protective".to_owned()
-                        } else {
-                            "unknown".to_owned()
-                        },
-                    };
-
-                    let now = clock.get_now().unwrap();
-                    let time = r2r::Clock::to_builtin_time(&now);
-
-                    let header = std_msgs::msg::Header {
-                        stamp: time,
-                        ..Default::default()
-                    };
-                    let to_send = sensor_msgs::msg::JointState {
-                        header,
-                        position: joints,
-                        name: vec![
-                            format!("{}_shoulder_pan_joint", tf_prefix),
-                            format!("{}_shoulder_lift_joint", tf_prefix),
-                            format!("{}_elbow_joint", tf_prefix),
-                            format!("{}_wrist_1_joint", tf_prefix),
-                            format!("{}_wrist_2_joint", tf_prefix),
-                            format!("{}_wrist_3_joint", tf_prefix),
-                        ],
-                        ..Default::default()
-                    };
-
-                    joint_publisher.publish(&to_send).unwrap();
-
                     ticker += 1;
-                    if ticker % 1000 == 0 {
+                    // update rate is 500 hz. we publish only at 10hz
+                    if ticker % 50 == 0 {
+                        println!("time: {:.1}s", time);
+
+
+                        let rob_send = std_msgs::msg::String {
+                            data: if robot_state == "1" {
+                                "normal".to_owned()
+                            } else if robot_state == "3" {
+                                "protective".to_owned()
+                            } else {
+                                "unknown".to_owned()
+                            },
+                        };
+
+                        let now = clock.get_now().unwrap();
+                        let time = r2r::Clock::to_builtin_time(&now);
+
+                        let header = std_msgs::msg::Header {
+                            stamp: time,
+                            ..Default::default()
+                        };
+                        let to_send = sensor_msgs::msg::JointState {
+                            header,
+                            position: joints,
+                            name: vec![
+                                format!("{}_shoulder_pan_joint", tf_prefix),
+                                format!("{}_shoulder_lift_joint", tf_prefix),
+                                format!("{}_elbow_joint", tf_prefix),
+                                format!("{}_wrist_1_joint", tf_prefix),
+                                format!("{}_wrist_2_joint", tf_prefix),
+                                format!("{}_wrist_3_joint", tf_prefix),
+                            ],
+                            ..Default::default()
+                        };
+
+                        joint_publisher.publish(&to_send).unwrap();
                         robot_publisher.publish(&rob_send).unwrap();
                         // println!("robot state {:?}", robot_state);
                         // println!("program state {:?}", program_state);
