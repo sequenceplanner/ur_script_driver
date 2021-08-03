@@ -73,12 +73,23 @@ fn accept_goal_cb(
     uuid: &r2r::uuid::Uuid,
     goal: &ExecuteScript::Goal,
 ) -> bool {
-    if driver_state.lock().unwrap().goal.is_some() {
-        println!(
-            "Already have a goal, rejecting request with goal id: {}, script: '{}'",
-            uuid, goal.script
-        );
-        return false;
+    {
+        let ds = driver_state.lock().unwrap();
+        if ds.goal.is_some() {
+            println!(
+                "Already have a goal, rejecting request with goal id: {}, script: '{}'",
+                uuid, goal.script
+            );
+            return false;
+        }
+
+        if ds.robot_state != "1" { //todo
+            println!(
+                "Robot is in protective stop, rejecting request with goal id: {}, script: '{}'",
+                uuid, goal.script
+            );
+            return false;
+        }
     }
     println!(
         "Accepting goal request with goal id: {}, script '{}'",
@@ -239,8 +250,10 @@ async fn realtime_reader(
             }
 
             if robot_state != "1" {
-                // robot has entered protective stop. If there is an active goal, abort it.
-                // we are finished. succeed and remove the action goal handle.
+                // robot has entered protective or emergency stop. If
+                // there is an active goal, abort it.  we are
+                // finished. succeed and remove the action goal
+                // handle.
                 let result_msg = ExecuteScript::Result { ok: false };
                 {
                     let mut ds = driver_state.lock().unwrap();
