@@ -1,16 +1,16 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
 use r2r::{Context, Node, ParameterValue, Publisher, ServerGoal};
-use std::sync::{Arc, Mutex};
 use std::io::{Error, ErrorKind};
-use tokio::io::{AsyncReadExt, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::task::{JoinHandle};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use ur_script_msgs::action::ExecuteScript;
 use ur_script_msgs::srv::DashboardCommand as DBCommand;
-use std::time::Duration;
 
 #[derive(Clone)]
 struct DriverState {
@@ -39,18 +39,21 @@ impl DriverState {
 
 fn handle_dashboard_command(
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
-    req: DBCommand::Request) -> DBCommand::Response {
+    req: DBCommand::Request,
+) -> DBCommand::Response {
     println!("got dashboard command request: {}", req.cmd);
     let dbc = DashboardCommand::ResetProtectiveStop;
 
     let (sender, future) = oneshot::channel();
-    dashboard_commands.try_send((dbc, sender)).expect("could not send...");
-    let ret = tokio::runtime::Runtime::new().expect("could not create runtime").block_on(future);
+    dashboard_commands
+        .try_send((dbc, sender))
+        .expect("could not send...");
+    let ret = tokio::runtime::Runtime::new()
+        .expect("could not create runtime")
+        .block_on(future);
     let ok = ret.is_ok();
 
-    let response = DBCommand::Response {
-        ok
-    };
+    let response = DBCommand::Response { ok };
     response
 }
 
@@ -95,7 +98,7 @@ async fn connect_loop(address: &str) -> TcpStream {
             Ok(s) => {
                 println!("connected to: {}", address);
                 return s;
-            },
+            }
             Err(e) => {
                 println!("could not connect to realtime at {}: {}", address, e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -106,7 +109,8 @@ async fn connect_loop(address: &str) -> TcpStream {
 
 async fn realtime_writer(
     mut incoming_scripts: mpsc::Receiver<std::string::String>,
-    ur_address: String) -> Result<(), std::io::Error> {
+    ur_address: String,
+) -> Result<(), std::io::Error> {
     loop {
         match incoming_scripts.recv().await {
             Some(data) => {
@@ -117,7 +121,7 @@ async fn realtime_writer(
                         println!("writing data to driver {}", data);
                         write_stream.write_all(data.as_bytes()).await?;
                         write_stream.flush().await?;
-                    },
+                    }
                     Err(_) => {
                         println!("could not connect to realtime port for writing");
                         return Err(Error::new(ErrorKind::Other, "oh no!"));
@@ -143,7 +147,11 @@ async fn realtime_reader(
     let mut size_bytes = [0u8; 4];
 
     loop {
-        let ret = timeout(Duration::from_millis(1000), stream.read_exact(&mut size_bytes)).await;
+        let ret = timeout(
+            Duration::from_millis(1000),
+            stream.read_exact(&mut size_bytes),
+        )
+        .await;
         // handle outer timeout error
         if let Err(_) = ret {
             println!("timeout on read, reconnecting...");
@@ -152,7 +160,7 @@ async fn realtime_reader(
         } else if let Ok(ret) = ret {
             if let Err(e) = ret {
                 println!("unexpected read error: {}", e);
-                return Err(Error::new(ErrorKind::Other, "oh no!"))
+                return Err(Error::new(ErrorKind::Other, "oh no!"));
             }
         }
         let msg_size = u32::from_be_bytes(size_bytes) as usize;
@@ -235,15 +243,22 @@ async fn realtime_reader(
             }
 
             // handle cancel requests
-            let is_cancelling = driver_state.lock().unwrap()
-                .goal.as_ref().map(|g|g.is_cancelling()).unwrap_or(false);
+            let is_cancelling = driver_state
+                .lock()
+                .unwrap()
+                .goal
+                .as_ref()
+                .map(|g| g.is_cancelling())
+                .unwrap_or(false);
             if !cancelling && is_cancelling {
                 // cancel and remove goal.
                 cancelling = true;
                 // this starts a race between completing the motion and cancelling via stopping.
                 // goal removal is done by the one that succeeds first.
                 let (sender, future) = oneshot::channel();
-                dashboard_commands.try_send((DashboardCommand::Stop, sender)).expect("could not send...");
+                dashboard_commands
+                    .try_send((DashboardCommand::Stop, sender))
+                    .expect("could not send...");
 
                 let driver_state_task = driver_state.clone();
                 tokio::spawn(async move {
@@ -271,17 +286,16 @@ async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
     joint_publisher: Publisher<sensor_msgs::msg::JointState>,
     robot_publisher: Publisher<std_msgs::msg::String>,
-    tf_prefix: String,
 ) -> Result<(), std::io::Error> {
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime).unwrap();
     let joint_names = vec![
-                format!("{}_shoulder_pan_joint", tf_prefix),
-                format!("{}_shoulder_lift_joint", tf_prefix),
-                format!("{}_elbow_joint", tf_prefix),
-                format!("{}_wrist_1_joint", tf_prefix),
-                format!("{}_wrist_2_joint", tf_prefix),
-                format!("{}_wrist_3_joint", tf_prefix),
-            ];
+        format!("shoulder_pan_joint"),
+        format!("shoulder_lift_joint"),
+        format!("elbow_joint"),
+        format!("wrist_1_joint"),
+        format!("wrist_2_joint"),
+        format!("wrist_3_joint"),
+    ];
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -337,21 +351,25 @@ async fn dashboard(
     let mut line = String::new();
     stream.read_line(&mut line).await?;
     if !line.contains("Connected: Universal Robots Dashboard Server") {
-        return Err(Error::new(ErrorKind::Other, "oh no!"))
+        return Err(Error::new(ErrorKind::Other, "oh no!"));
     }
 
-    stream.write_all(String::from("get robot model\n").as_bytes()).await?;
+    stream
+        .write_all(String::from("get robot model\n").as_bytes())
+        .await?;
     stream.flush().await?;
     let mut robot_model = String::new();
     stream.read_line(&mut robot_model).await?;
     println!("robot model: {}", robot_model);
 
     // check that robot is in remote control
-    stream.write_all(String::from("is in remote control\n").as_bytes()).await?;
+    stream
+        .write_all(String::from("is in remote control\n").as_bytes())
+        .await?;
     let mut line = String::new();
     stream.read_line(&mut line).await?;
     if !line.contains("true") {
-        return Err(Error::new(ErrorKind::Other, "must be in remote mode"))
+        return Err(Error::new(ErrorKind::Other, "must be in remote mode"));
     }
 
     loop {
@@ -359,13 +377,12 @@ async fn dashboard(
 
         println!("dashboard writer got command {:?}", cmd);
 
-        let (command, expected_response) =
-            match cmd {
-                DashboardCommand::Stop =>
-                    ("stop\n", "Stopped"),
-                DashboardCommand::ResetProtectiveStop =>
-                    ("unlock protective stop\n", "Protective stop releasing"),
-            };
+        let (command, expected_response) = match cmd {
+            DashboardCommand::Stop => ("stop\n", "Stopped"),
+            DashboardCommand::ResetProtectiveStop => {
+                ("unlock protective stop\n", "Protective stop releasing")
+            }
+        };
 
         println!("writing command to driver {}", command);
         stream.write_all(command.as_bytes()).await?;
@@ -380,8 +397,10 @@ async fn dashboard(
                 // ignore this error for now?
             }
         } else {
-            println!("failed to execute command via dashboard: {}, expected: {}",
-                     response, expected_response);
+            println!(
+                "failed to execute command via dashboard: {}, expected: {}",
+                response, expected_response
+            );
             if let Err(_) = channel.send(false) {
                 println!("dropped dashboard return channel");
                 // ignore this error for now?
@@ -415,24 +434,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ur_dashboard_address = format!("{}:29999", ur_address);
     let ur_address = format!("{}:30003", ur_address);
 
-    let tf_prefix = if let Some(ParameterValue::String(s)) = node.params.get("tf_prefix").as_ref() {
-        s.to_owned()
-    } else {
-        "".to_owned()
-    };
-
-
     let joint_publisher = node.create_publisher::<sensor_msgs::msg::JointState>("joint_states")?;
     let rob_publisher = node.create_publisher::<std_msgs::msg::String>("robot_state")?;
 
     let (tx, rx) = mpsc::channel::<String>(10);
-    let (tx_dashboard, rx_dashboard) = mpsc::channel::<(DashboardCommand, oneshot::Sender<bool>)>(10);
+    let (tx_dashboard, rx_dashboard) =
+        mpsc::channel::<(DashboardCommand, oneshot::Sender<bool>)>(10);
 
     let txd = tx_dashboard.clone();
-    let _dashboard_service = node.create_service::<DBCommand::Service>("dashboard_command",
-                                                                       Box::new(move |r| {
-                                                                           handle_dashboard_command(txd.clone(), r)}
-                                                                       ))?;
+    let _dashboard_service = node.create_service::<DBCommand::Service>(
+        "dashboard_command",
+        Box::new(move |r| handle_dashboard_command(txd.clone(), r)),
+    )?;
 
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
 
@@ -462,16 +475,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tx_dashboard,
         ur_address.to_owned(),
     );
-    let realtime_writer = realtime_writer(
-        rx,
-        ur_address.to_owned(),
-    );
-    let state_publisher = state_publisher(
-        task_shared_state.clone(),
-        joint_publisher,
-        rob_publisher,
-        tf_prefix.to_owned(),
-    );
+    let realtime_writer = realtime_writer(rx, ur_address.to_owned());
+    let state_publisher =
+        state_publisher(task_shared_state.clone(), joint_publisher, rob_publisher);
 
     let blocking_shared_state = task_shared_state.clone();
     let ros: JoinHandle<Result<(), Error>> = tokio::task::spawn_blocking(move || {
@@ -482,12 +488,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let dashboard = dashboard(rx_dashboard, ur_dashboard_address.to_owned());
-    let ret = tokio::try_join!(realtime_reader, realtime_writer, dashboard, state_publisher, flatten_error(ros));
+    let ret = tokio::try_join!(
+        realtime_reader,
+        realtime_writer,
+        dashboard,
+        state_publisher,
+        flatten_error(ros)
+    );
     match ret {
         Err(e) => {
             (*task_shared_state.lock().unwrap()).running = false;
             return Err(Box::new(e));
-        },
+        }
         Ok(_) => {
             // will never get here.
             return Ok(());
@@ -503,8 +515,8 @@ async fn main() -> () {
             Err(e) => {
                 println!("fatal error: {}", e);
                 tokio::time::sleep(Duration::from_secs(2)).await;
-            },
-           _ => {},
+            }
+            _ => {}
         }
     }
 }
