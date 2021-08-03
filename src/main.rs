@@ -1,8 +1,9 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
-use r2r::{Context, Node, ParameterValue, Publisher, ServerGoal};
+use r2r::{Context, Node, ParameterValue, Publisher, ServerGoal, ServiceRequest};
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use futures::stream::{Stream, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -37,24 +38,32 @@ impl DriverState {
     }
 }
 
-fn handle_dashboard_command(
+async fn handle_dashboard_commands(
+    mut service: impl Stream<Item = ServiceRequest<DBCommand::Service>> + Unpin,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
-    req: DBCommand::Request,
-) -> DBCommand::Response {
-    println!("got dashboard command request: {}", req.cmd);
-    let dbc = DashboardCommand::ResetProtectiveStop;
+)  -> Result<(), std::io::Error> {
+    loop {
+        match service.next().await {
+            Some(req) => {
+                println!("got dashboard command request: {:?}", req.message);
+                let dbc = if req.message.cmd.contains("reset_protective_stop") {
+                    DashboardCommand::ResetProtectiveStop
+                } else { // todo: implement more.
+                    DashboardCommand::Stop
+                };
 
-    let (sender, future) = oneshot::channel();
-    dashboard_commands
-        .try_send((dbc, sender))
-        .expect("could not send...");
-    let ret = tokio::runtime::Runtime::new()
-        .expect("could not create runtime")
-        .block_on(future);
-    let ok = ret.is_ok();
+                let (sender, future) = oneshot::channel();
+                dashboard_commands.try_send((dbc, sender)).expect("could not send");
+                let ret = future.await;
+                let ok = ret.is_ok();
 
-    let response = DBCommand::Response { ok };
-    response
+                let resp = DBCommand::Response { ok };
+                req.respond(resp);
+            }
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 // note: cannot be blocking.
@@ -442,10 +451,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mpsc::channel::<(DashboardCommand, oneshot::Sender<bool>)>(10);
 
     let txd = tx_dashboard.clone();
-    let _dashboard_service = node.create_service::<DBCommand::Service>(
-        "dashboard_command",
-        Box::new(move |r| handle_dashboard_command(txd.clone(), r)),
-    )?;
+    let dashboard_service = node.create_service::<DBCommand::Service>("dashboard_command")?;
+
+    let dashboard_task = handle_dashboard_commands(dashboard_service, txd);
 
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
 
@@ -493,6 +501,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         realtime_writer,
         dashboard,
         state_publisher,
+        dashboard_task,
         flatten_error(ros)
     );
     match ret {
