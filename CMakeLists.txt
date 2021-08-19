@@ -11,6 +11,8 @@ r2r_cargo(sensor_msgs
           ur_script_msgs
           rcl
           rcl_action
+          rmw_fastrtps_cpp       # (needed to build with RMW_IMPLEMENTATION=rmw_fastrtps_cpp)
+          FastRTPS               # (needed to build with RMW_IMPLEMENTATION=rmw_fastrtps_cpp)
          )
 
 # install binaries
