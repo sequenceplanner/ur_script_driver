@@ -19,10 +19,18 @@ struct DriverState {
     // only handle one goal at the time.
     // later think about allowing goals to be queued up
     goal: Option<ServerGoal<ExecuteScript::Action>>,
-    robot_state: String,
-    program_state: String,
+    robot_state: i32,
+    program_state: i32,
     joint_values: Vec<f64>,
     joint_speeds: Vec<f64>,
+    output_bit0: bool,
+    output_bit1: bool,
+    output_bit2: bool,
+    output_bit3: bool,
+    output_bit4: bool,
+    output_bit5: bool,
+    output_bit6: bool,
+    output_bit7: bool,
 }
 
 impl DriverState {
@@ -30,10 +38,18 @@ impl DriverState {
         DriverState {
             running: true,
             goal: None,
-            robot_state: "Idle".into(),
-            program_state: "0".into(),
+            robot_state: 0,
+            program_state: 0,
             joint_values: vec![],
             joint_speeds: vec![],
+            output_bit0: false,
+            output_bit1: false,
+            output_bit2: false,
+            output_bit3: false,
+            output_bit4: false,
+            output_bit5: false,
+            output_bit6: false,
+            output_bit7: false,
         }
     }
 }
@@ -83,7 +99,7 @@ fn accept_goal_cb(
             return false;
         }
 
-        if ds.robot_state != "1" { //todo
+        if ds.robot_state != 1 { //todo
             println!(
                 "Robot is in protective stop, rejecting request with goal id: {}, script: '{}'",
                 uuid, goal.script
@@ -208,9 +224,13 @@ async fn realtime_reader(
                 let joint_speed = read_f64(&buf[index..index + 8]);
                 speeds.push(joint_speed);
             }
-            let robot_state = read_f64(&buf[808..816]).to_string();
+            let robot_state = read_f64(&buf[808..816]) as i32;
             // println!("robot state {:?}", robot_state);
-            let program_state = read_f64(&buf[1048..1056]).to_string();
+
+            let digital_outputs = read_f64(&buf[1040..1048]);
+            let digital_outputs: u8 = digital_outputs as u8;
+
+            let program_state = read_f64(&buf[1048..1056]) as i32;
             // println!("program state {:?}", program_state);
 
             // update program state.
@@ -220,18 +240,26 @@ async fn realtime_reader(
                 (*ds).joint_speeds = speeds;
                 (*ds).robot_state = robot_state.clone();
                 (*ds).program_state = program_state.clone();
+                (*ds).output_bit0 = digital_outputs & 1 == 1;
+                (*ds).output_bit1 = digital_outputs & 2 == 2;
+                (*ds).output_bit2 = digital_outputs & 4 == 4;
+                (*ds).output_bit3 = digital_outputs & 8 == 8;
+                (*ds).output_bit4 = digital_outputs & 16 == 16;
+                (*ds).output_bit5 = digital_outputs & 32 == 32;
+                (*ds).output_bit6 = digital_outputs & 64 == 64;
+                (*ds).output_bit7 = digital_outputs & 128 == 128;
                 (*ds).goal.is_some()
             };
 
-            // when we have a goal, first wait until program_state reaches "2'
-            if program_running && program_state == "2" && !checking_for_1 {
+            // when we have a goal, first wait until program_state reaches 2
+            if program_running && program_state == 2 && !checking_for_1 {
                 println!("program started, waiting for finish");
                 checking_for_1 = true;
             }
 
-            // when the program state has been "2" and goes back to
-            // "1", the goal has succeeded
-            if checking_for_1 && program_state == "1" {
+            // when the program state has been 2 and goes back to
+            // 1, the goal has succeeded
+            if checking_for_1 && program_state == 1 {
                 println!("program started and has now finished");
                 // reset state machine
                 checking_for_1 = false;
@@ -249,7 +277,7 @@ async fn realtime_reader(
                 }
             }
 
-            if robot_state != "1" {
+            if robot_state != 1 {
                 // robot has entered protective or emergency stop. If
                 // there is an active goal, abort it.  we are
                 // finished. succeed and remove the action goal
@@ -307,7 +335,7 @@ async fn realtime_reader(
 async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
     joint_publisher: Publisher<sensor_msgs::msg::JointState>,
-    robot_publisher: Publisher<std_msgs::msg::String>,
+    measured_publisher: Publisher<ur_script_msgs::msg::Measured>,
 ) -> Result<(), std::io::Error> {
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime).unwrap();
     let joint_names = vec![
@@ -324,18 +352,22 @@ async fn state_publisher(
         let now = clock.get_now().unwrap();
         let time = r2r::Clock::to_builtin_time(&now);
 
-        let (joint_values, rob_send) = {
+        let (joint_values, measured) = {
             let ds = driver_state.lock().unwrap();
-            let rob_send = std_msgs::msg::String {
-                data: if (*ds).robot_state == "1" {
-                    "normal".to_owned()
-                } else if (*ds).robot_state == "3" {
-                    "protective".to_owned()
-                } else {
-                    "unknown".to_owned()
-                },
+
+            let measured = ur_script_msgs::msg::Measured {
+                robot_state: (*ds).robot_state,
+                program_state: (*ds).program_state,
+                out0: (*ds).output_bit0,
+                out1: (*ds).output_bit1,
+                out2: (*ds).output_bit2,
+                out3: (*ds).output_bit3,
+                out4: (*ds).output_bit4,
+                out5: (*ds).output_bit5,
+                out6: (*ds).output_bit6,
+                out7: (*ds).output_bit7,
             };
-            ((*ds).joint_values.clone(), rob_send)
+            ((*ds).joint_values.clone(), measured)
         };
 
         let header = std_msgs::msg::Header {
@@ -350,9 +382,7 @@ async fn state_publisher(
         };
 
         joint_publisher.publish(&to_send).unwrap();
-        robot_publisher.publish(&rob_send).unwrap();
-        // println!("robot state {:?}", robot_state);
-        // println!("program state {:?}", program_state);
+        measured_publisher.publish(&measured).unwrap();
     }
 }
 
@@ -450,14 +480,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         s.to_owned()
     } else {
-        "192.168.2.125".to_owned()
+        // "192.168.2.125".to_owned()
+        "192.168.1.31".to_owned()
     };
 
     let ur_dashboard_address = format!("{}:29999", ur_address);
     let ur_address = format!("{}:30003", ur_address);
 
     let joint_publisher = node.create_publisher::<sensor_msgs::msg::JointState>("joint_states")?;
-    let rob_publisher = node.create_publisher::<std_msgs::msg::String>("robot_state")?;
+    let measured_publisher = node.create_publisher::<ur_script_msgs::msg::Measured>("measured")?;
 
     let (tx, rx) = mpsc::channel::<String>(10);
     let (tx_dashboard, rx_dashboard) =
@@ -498,7 +529,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let realtime_writer = realtime_writer(rx, ur_address.to_owned());
     let state_publisher =
-        state_publisher(task_shared_state.clone(), joint_publisher, rob_publisher);
+        state_publisher(task_shared_state.clone(), joint_publisher, measured_publisher);
 
     let blocking_shared_state = task_shared_state.clone();
     let ros: JoinHandle<Result<(), Error>> = tokio::task::spawn_blocking(move || {
