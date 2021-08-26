@@ -245,9 +245,7 @@ async fn realtime_reader(
                 speeds.push(joint_speed);
             }
 
-            let digital_inputs1 = read_f64(&buf[680..688]);
-            let digital_inputs = digital_inputs1 as u32;
-            println!("DI: {}  -- {}", digital_inputs1, digital_inputs);
+            let digital_inputs = read_f64(&buf[680..688]) as u32;
 
             let robot_state = read_f64(&buf[808..816]) as i32;
             // println!("robot state {:?}", robot_state);
