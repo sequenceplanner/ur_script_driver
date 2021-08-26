@@ -23,6 +23,16 @@ struct DriverState {
     program_state: i32,
     joint_values: Vec<f64>,
     joint_speeds: Vec<f64>,
+    input_bit0: bool,
+    input_bit1: bool,
+    input_bit2: bool,
+    input_bit3: bool,
+    input_bit4: bool,
+    input_bit5: bool,
+    input_bit6: bool,
+    input_bit7: bool,
+    input_bit8: bool,
+    input_bit9: bool,
     output_bit0: bool,
     output_bit1: bool,
     output_bit2: bool,
@@ -42,6 +52,16 @@ impl DriverState {
             program_state: 0,
             joint_values: vec![],
             joint_speeds: vec![],
+            input_bit0: false,
+            input_bit1: false,
+            input_bit2: false,
+            input_bit3: false,
+            input_bit4: false,
+            input_bit5: false,
+            input_bit6: false,
+            input_bit7: false,
+            input_bit8: false,
+            input_bit9: false,
             output_bit0: false,
             output_bit1: false,
             output_bit2: false,
@@ -224,6 +244,11 @@ async fn realtime_reader(
                 let joint_speed = read_f64(&buf[index..index + 8]);
                 speeds.push(joint_speed);
             }
+
+            let digital_inputs1 = read_f64(&buf[680..688]);
+            let digital_inputs = digital_inputs1 as u32;
+            println!("DI: {}  -- {}", digital_inputs1, digital_inputs);
+
             let robot_state = read_f64(&buf[808..816]) as i32;
             // println!("robot state {:?}", robot_state);
 
@@ -240,6 +265,17 @@ async fn realtime_reader(
                 (*ds).joint_speeds = speeds;
                 (*ds).robot_state = robot_state.clone();
                 (*ds).program_state = program_state.clone();
+                (*ds).input_bit0 = digital_inputs & 1 == 1;
+                (*ds).input_bit1 = digital_inputs & 2 == 2;
+                (*ds).input_bit2 = digital_inputs & 4 == 4;
+                (*ds).input_bit3 = digital_inputs & 8 == 8;
+                (*ds).input_bit4 = digital_inputs & 16 == 16;
+                (*ds).input_bit5 = digital_inputs & 32 == 32;
+                (*ds).input_bit6 = digital_inputs & 64 == 64;
+                (*ds).input_bit7 = digital_inputs & 128 == 128;
+                (*ds).input_bit8 = digital_inputs & 65536 == 65536;
+                (*ds).input_bit9 = digital_inputs & 131072 == 131072;
+
                 (*ds).output_bit0 = digital_outputs & 1 == 1;
                 (*ds).output_bit1 = digital_outputs & 2 == 2;
                 (*ds).output_bit2 = digital_outputs & 4 == 4;
@@ -358,6 +394,18 @@ async fn state_publisher(
             let measured = ur_script_msgs::msg::Measured {
                 robot_state: (*ds).robot_state,
                 program_state: (*ds).program_state,
+
+                in0: (*ds).input_bit0,
+                in1: (*ds).input_bit1,
+                in2: (*ds).input_bit2,
+                in3: (*ds).input_bit3,
+                in4: (*ds).input_bit4,
+                in5: (*ds).input_bit5,
+                in6: (*ds).input_bit6,
+                in7: (*ds).input_bit7,
+                in8: (*ds).input_bit8,
+                in9: (*ds).input_bit9,
+
                 out0: (*ds).output_bit0,
                 out1: (*ds).output_bit1,
                 out2: (*ds).output_bit2,
