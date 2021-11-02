@@ -198,7 +198,7 @@ async fn realtime_reader(
     ur_address: String,
 ) -> Result<(), std::io::Error> {
     let mut checking_for_1 = false;
-    let mut checking_for_1_since = None;
+    // let mut checking_for_1_since = None;
     let mut cancelling = false;
     let mut stream = connect_loop(&ur_address).await;
     let mut size_bytes = [0u8; 4];
@@ -253,7 +253,7 @@ async fn realtime_reader(
                 forces.push(f);
             }
 
-            println!("force vector {:?}", forces);
+            // println!("force vector {:?}", forces);
 
             let digital_inputs = read_f64(&buf[680..688]) as u32;
 
@@ -295,25 +295,25 @@ async fn realtime_reader(
                 (*ds).goal.is_some()
             };
 
-            if program_running && checking_for_1_since.is_none() {
-                // flank check for when we requested program (waiting for program state 2)
-                checking_for_1_since = Some(std::time::Instant::now());
-            }
+            // if program_running && checking_for_1_since.is_none() {
+            //     // flank check for when we requested program (waiting for program state 2)
+            //     checking_for_1_since = Some(std::time::Instant::now());
+            // }
 
-            if program_running && checking_for_1_since.is_some() && program_state == 1 {
-                // we are currently waiting for program state == 2
-                let elapsed_since_request = checking_for_1_since.unwrap().elapsed();
-                if elapsed_since_request > std::time::Duration::from_millis(100) {
-                    let result_msg = ExecuteScript::Result { ok: false };
-                    {
-                        let mut ds = driver_state.lock().unwrap();
-                        if let Some(mut goal) = ds.goal.take() {
-                            println!("program state never changed");
-                            goal.abort(result_msg).expect("could not abort goal");
-                        }
-                    }
-                }
-            }
+            // if program_running && checking_for_1_since.is_some() && program_state == 1 {
+            //     // we are currently waiting for program state == 2
+            //     let elapsed_since_request = checking_for_1_since.unwrap().elapsed();
+            //     if elapsed_since_request > std::time::Duration::from_millis(100) {
+            //         let result_msg = ExecuteScript::Result { ok: false };
+            //         {
+            //             let mut ds = driver_state.lock().unwrap();
+            //             if let Some(mut goal) = ds.goal.take() {
+            //                 println!("program state never changed");
+            //                 goal.abort(result_msg).expect("could not abort goal");
+            //             }
+            //         }
+            //     }
+            // }
 
             // when we have a goal, first wait until program_state reaches 2
             if program_running && program_state == 2 && !checking_for_1 {
