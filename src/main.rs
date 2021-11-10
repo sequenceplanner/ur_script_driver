@@ -260,8 +260,8 @@ async fn realtime_reader(
             let robot_state = read_f64(&buf[808..816]) as i32;
             // println!("robot state {:?}", robot_state);
 
-            let digital_outputs = read_f64(&buf[1040..1048]);
-            let digital_outputs: u8 = digital_outputs as u8;
+            let digital_outputs = read_f64(&buf[1040..1048]) as u32;
+            // println!("digital out state {:?}", digital_outputs);
 
             let program_state = read_f64(&buf[1048..1056]) as i32;
             // println!("program state {:?}", program_state);
