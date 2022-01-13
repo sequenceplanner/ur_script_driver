@@ -1,9 +1,10 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
-use r2r::{Context, Node, ParameterValue, Publisher, ServerGoal, ServiceRequest};
+use r2r::{Context, Node, ParameterValue, Publisher, ActionServerGoal, ServiceRequest};
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use futures::stream::{Stream, StreamExt};
+use futures::future::{self, Either};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -13,12 +14,12 @@ use tokio::time::timeout;
 use ur_script_msgs::action::ExecuteScript;
 use ur_script_msgs::srv::DashboardCommand as DBCommand;
 
-#[derive(Clone)]
 struct DriverState {
     running: bool,
     // only handle one goal at the time.
     // later think about allowing goals to be queued up
-    goal: Option<ServerGoal<ExecuteScript::Action>>,
+    goal: Option<ActionServerGoal<ExecuteScript::Action>>,
+    goal_sender: Option<oneshot::Sender<()>>,
     robot_state: i32,
     program_state: i32,
     joint_values: Vec<f64>,
@@ -48,6 +49,7 @@ impl DriverState {
         DriverState {
             running: true,
             goal: None,
+            goal_sender: None,
             robot_state: 0,
             program_state: 0,
             joint_values: vec![],
@@ -102,43 +104,111 @@ async fn handle_dashboard_commands(
     Ok(())
 }
 
-// note: cannot be blocking.
-// todo: do more here such as checking if we are in protective stop
-fn accept_goal_cb(
+async fn action_server(
+    ur_address: String,
     driver_state: Arc<Mutex<DriverState>>,
-    uuid: &r2r::uuid::Uuid,
-    goal: &ExecuteScript::Goal,
-) -> bool {
-    {
-        let ds = driver_state.lock().unwrap();
-        if ds.goal.is_some() {
-            println!(
-                "Already have a goal, rejecting request with goal id: {}, script: '{}'",
-                uuid, goal.script
-            );
-            return false;
-        }
+    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
+    mut requests: impl Stream<Item = r2r::ActionServerGoalRequest<ExecuteScript::Action>> + Unpin,
+) -> Result<(), std::io::Error> {
+    loop {
+        match requests.next().await {
+            Some(req) => {
 
-        if ds.robot_state != 1 { //todo
-            println!(
-                "Robot is in protective stop, rejecting request with goal id: {}, script: '{}'",
-                uuid, goal.script
-            );
-            return false;
+                if driver_state.lock().unwrap().goal.is_some() {
+                    println!(
+                        "Already have a goal, rejecting request with goal id: {}, script: '{}'",
+                        req.uuid, req.goal.script
+                    );
+                    req.reject().expect("could not reject goal");
+                    continue;
+                }
+
+                if driver_state.lock().unwrap().robot_state != 1 { //todo
+                    println!(
+                        "Robot is in protective stop, rejecting request with goal id: {}, script: '{}'",
+                        req.uuid, req.goal.script
+                    );
+                    req.reject().expect("could not reject goal");
+                    continue;
+                }
+
+                println!(
+                    "Accepting goal request with goal id: {}, script '{}'",
+                    req.uuid, req.goal.script
+                );
+
+                let (goal_sender, goal_receiver) = oneshot::channel::<()>();
+                let (mut g, mut cancel) = req.accept().expect("could not accept goal");
+
+                println!("making a new connection to the driver.");
+                let ret = TcpStream::connect(&ur_address).await;
+                match ret {
+                    Ok(mut write_stream) => {
+                        println!("writing data to driver {}", g.goal.script);
+                        write_stream.write_all(g.goal.script.as_bytes()).await?;
+                        write_stream.flush().await?;
+                    }
+                    Err(_) => {
+                        println!("could not connect to realtime port for writing");
+                        return Err(Error::new(ErrorKind::Other, "oh no!"));
+                    }
+                }
+
+                {
+                    let mut ds = driver_state.lock().unwrap();
+                    ds.goal = Some(g.clone());
+                    ds.goal_sender = Some(goal_sender);
+                }
+
+                match future::select(goal_receiver, cancel.next()).await {
+                    Either::Left(_) => {
+                        // success.
+                        println!("goal completed!");
+                        let result_msg = ExecuteScript::Result { ok: true };
+                        g.succeed(result_msg).expect("could not send result");
+                    },
+                    Either::Right((request, goal_receiver)) => {
+                        if let Some(request) = request {
+                            println!("got cancel request: {}", request.uuid);
+                            request.accept();
+
+                            // this starts a race between completing
+                            // the motion and cancelling via stopping.
+                            // goal removal is done by the one that
+                            // succeeds first.
+                            let (sender, cancel_receiver) = oneshot::channel();
+                            dashboard_commands
+                                .try_send((DashboardCommand::Stop, sender))
+                                .expect("could not send...");
+
+                            let driver_state_task = driver_state.clone();
+
+                            match future::select(cancel_receiver, goal_receiver).await {
+                                Either::Left((res, _goal_receiver)) => {
+                                    // cancelled using dashboard
+                                    // todo: check res
+                                    let result_msg = ExecuteScript::Result { ok: false };
+                                    if let Some(mut goal) = driver_state_task.lock().unwrap().goal.take() {
+                                        goal.cancel(result_msg).expect("could not cancel goal");
+                                    }
+                                },
+                                Either::Right((res, _cancel_receiver)) => {
+                                    // finished executing anyway
+                                    // todo: check res
+                                    let result_msg = ExecuteScript::Result { ok: true };
+                                    if let Some(mut goal) = driver_state_task.lock().unwrap().goal.take() {
+                                        goal.cancel(result_msg).expect("could not cancel goal");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+            None => break,
         }
     }
-    println!(
-        "Accepting goal request with goal id: {}, script '{}'",
-        uuid, goal.script
-    );
-    true // always accept
-}
-
-// note: cannot be blocking.
-fn accept_cancel_cb(goal: &r2r::ServerGoal<ExecuteScript::Action>) -> bool {
-    println!("Got request to cancel {}", goal.uuid);
-    // always accept cancel requests
-    true
+    Ok(())
 }
 
 fn read_f64(slice: &[u8]) -> f64 {
@@ -163,38 +233,8 @@ async fn connect_loop(address: &str) -> TcpStream {
     }
 }
 
-async fn realtime_writer(
-    mut incoming_scripts: mpsc::Receiver<std::string::String>,
-    ur_address: String,
-) -> Result<(), std::io::Error> {
-    loop {
-        match incoming_scripts.recv().await {
-            Some(data) => {
-                println!("making a new connection to the driver.");
-                let ret = TcpStream::connect(&ur_address).await;
-                match ret {
-                    Ok(mut write_stream) => {
-                        println!("writing data to driver {}", data);
-                        write_stream.write_all(data.as_bytes()).await?;
-                        write_stream.flush().await?;
-                    }
-                    Err(_) => {
-                        println!("could not connect to realtime port for writing");
-                        return Err(Error::new(ErrorKind::Other, "oh no!"));
-                    }
-                }
-            }
-            None => {
-                println!("channel closed");
-                return Err(Error::new(ErrorKind::Other, "oh no!"));
-            }
-        }
-    }
-}
-
 async fn realtime_reader(
     driver_state: Arc<Mutex<DriverState>>,
-    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     ur_address: String,
 ) -> Result<(), std::io::Error> {
     let mut checking_for_1 = false;
@@ -354,43 +394,6 @@ async fn realtime_reader(
                         goal.abort(result_msg).expect("could not abort goal");
                     }
                 }
-            }
-
-            // handle cancel requests
-            let is_cancelling = driver_state
-                .lock()
-                .unwrap()
-                .goal
-                .as_ref()
-                .map(|g| g.is_cancelling())
-                .unwrap_or(false);
-            if !cancelling && is_cancelling {
-                // cancel and remove goal.
-                cancelling = true;
-                // this starts a race between completing the motion and cancelling via stopping.
-                // goal removal is done by the one that succeeds first.
-                let (sender, future) = oneshot::channel();
-                dashboard_commands
-                    .try_send((DashboardCommand::Stop, sender))
-                    .expect("could not send...");
-
-                let driver_state_task = driver_state.clone();
-                tokio::spawn(async move {
-                    if future.await.expect("failed to await cancel result") {
-                        // successfully canceled.
-                        println!("cancel success...");
-                        let result_msg = ExecuteScript::Result { ok: false };
-                        if let Some(mut goal) = driver_state_task.lock().unwrap().goal.take() {
-                            goal.cancel(result_msg).expect("could not cancel goal");
-                        }
-                    } else {
-                        println!("failed to cancel... doing nothing.");
-                    }
-                });
-            }
-
-            if !is_cancelling {
-                cancelling = false;
             }
         }
     }
@@ -552,7 +555,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ros_ctx = Context::create()?;
     let mut node = Node::create(ros_ctx, "ur_script_driver", "")?;
 
-    let ur_address = if let Some(ParameterValue::String(s)) = node.params.get("ur_address").as_ref()
+    let ur_address = if let Some(ParameterValue::String(s)) = node.params
+        .lock().unwrap().get("ur_address").as_ref()
     {
         s.to_owned()
     } else {
@@ -563,8 +567,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ur_dashboard_address = format!("{}:29999", ur_address);
     let ur_address = format!("{}:30003", ur_address);
 
-    let joint_publisher = node.create_publisher::<sensor_msgs::msg::JointState>("joint_states")?;
-    let measured_publisher = node.create_publisher::<ur_script_msgs::msg::Measured>("measured")?;
+    let joint_publisher = node
+        .create_publisher::<sensor_msgs::msg::JointState>("joint_states",
+                                                          r2r::qos::QosProfile::default())?;
+    let measured_publisher = node
+        .create_publisher::<ur_script_msgs::msg::Measured>("measured",
+                                                           r2r::qos::QosProfile::default())?;
 
     let (tx, rx) = mpsc::channel::<String>(10);
     let (tx_dashboard, rx_dashboard) =
@@ -578,7 +586,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
 
     let shared_state_cb = shared_state.clone();
-    let handle_goal_cb = move |g: r2r::ServerGoal<ExecuteScript::Action>| {
+    let handle_goal_cb = move |g: r2r::ActionServerGoal<ExecuteScript::Action>| {
         // since we already know that we do not accept goal unless we
         // don't already have one, simply set this goal handle as the
         // currently active goal...
@@ -588,22 +596,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .expect("could not send new script");
     };
 
-    let shared_state_cb = shared_state.clone();
-    let _server = node.create_action_server::<ExecuteScript::Action>(
-        "ur_script",
-        Box::new(move |uuid, goal| accept_goal_cb(shared_state_cb.clone(), uuid, goal)),
-        Box::new(accept_cancel_cb),
-        Box::new(handle_goal_cb),
-    )?;
+    let server_requests = node
+        .create_action_server::<ExecuteScript::Action>("ur_script")?;
+
+    let shared_state_action = shared_state.clone();
+    let action_task = action_server(ur_address.to_owned(),
+                                    shared_state_action,
+                                    tx_dashboard,
+                                    server_requests);
+
+    // let _server = node.create_action_server::<ExecuteScript::Action>(
+    //     "ur_script",
+    //     Box::new(move |uuid, goal| accept_goal_cb(shared_state_cb.clone(), uuid, goal)),
+    //     Box::new(accept_cancel_cb),
+    //     Box::new(handle_goal_cb),
+    // )?;
 
     let task_shared_state = shared_state.clone();
 
     let realtime_reader = realtime_reader(
         task_shared_state.clone(),
-        tx_dashboard,
         ur_address.to_owned(),
     );
-    let realtime_writer = realtime_writer(rx, ur_address.to_owned());
     let state_publisher =
         state_publisher(task_shared_state.clone(), joint_publisher, measured_publisher);
 
@@ -617,8 +631,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let dashboard = dashboard(rx_dashboard, ur_dashboard_address.to_owned());
     let ret = tokio::try_join!(
+        action_task,
         realtime_reader,
-        realtime_writer,
         dashboard,
         state_publisher,
         dashboard_task,
