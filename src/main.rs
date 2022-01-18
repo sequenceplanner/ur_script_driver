@@ -16,6 +16,7 @@ use ur_script_msgs::srv::DashboardCommand as DBCommand;
 
 struct DriverState {
     running: bool,
+    connected: bool,
     // only handle one goal at the time. reply with true/false if
     // script executed successfully.
     goal_sender: Option<oneshot::Sender<bool>>,
@@ -47,6 +48,7 @@ impl DriverState {
     fn new() -> Self {
         DriverState {
             running: true,
+            connected: false,
             goal_sender: None,
             robot_state: 0,
             program_state: 0,
@@ -111,11 +113,19 @@ async fn action_server(
     loop {
         match requests.next().await {
             Some(req) => {
+                if !driver_state.lock().unwrap().connected {
+                    println!(
+                        "No connection to the robot, rejecting request with goal id: {}, script: '{}'",
+                        req.uuid, req.goal.script
+                    );
+                    req.reject().expect("could not reject goal");
+                    continue;
+                }
 
                 if driver_state.lock().unwrap().robot_state != 1 { //todo
                     println!(
-                        "Robot is in protective stop, rejecting request with goal id: {}, script: '{}'",
-                        req.uuid, req.goal.script
+                        "Robot is not in normal mode (state={}) stop, rejecting request with goal id: {}, script: '{}'",
+                        driver_state.lock().unwrap().robot_state, req.uuid, req.goal.script
                     );
                     req.reject().expect("could not reject goal");
                     continue;
@@ -130,18 +140,17 @@ async fn action_server(
                 let (mut g, mut cancel) = req.accept().expect("could not accept goal");
 
                 println!("making a new connection to the driver.");
-                let ret = TcpStream::connect(&ur_address).await;
-                match ret {
-                    Ok(mut write_stream) => {
-                        println!("writing data to driver {}", g.goal.script);
-                        write_stream.write_all(g.goal.script.as_bytes()).await?;
-                        write_stream.flush().await?;
-                    }
+                let conn = TcpStream::connect(&ur_address).await;
+                let mut write_stream = match conn {
+                    Ok(write_stream) => write_stream,
                     Err(_) => {
                         println!("could not connect to realtime port for writing");
                         return Err(Error::new(ErrorKind::Other, "oh no!"));
                     }
-                }
+                };
+                println!("writing data to driver {}", g.goal.script);
+                write_stream.write_all(g.goal.script.as_bytes()).await?;
+                write_stream.flush().await?;
 
                 {
                     let mut ds = driver_state.lock().unwrap();
@@ -151,13 +160,15 @@ async fn action_server(
                 match future::select(goal_receiver, cancel.next()).await {
                     Either::Left((res, _cancel_stream)) => {
                         // success.
-                        println!("goal completed!");
                         if let Ok(ok) = res {
+                            println!("goal completed? {}", ok);
                             let result_msg = ExecuteScript::Result { ok };
                             // TODO: perhaps g.abort here if ok is false.
                             g.succeed(result_msg).expect("could not send result");
                         } else {
                             println!("future appears canceled...");
+                            let result_msg = ExecuteScript::Result { ok: false };
+                            g.abort(result_msg).expect("task cancelled");
                         }
                     },
                     Either::Right((request, goal_receiver)) => {
@@ -177,18 +188,24 @@ async fn action_server(
                             match future::select(cancel_receiver, goal_receiver).await {
                                 Either::Left((res, _goal_receiver)) => {
                                     // cancelled using dashboard
-                                    // todo: check res
                                     if let Ok(ok) = res {
                                         let result_msg = ExecuteScript::Result { ok };
                                         g.cancel(result_msg).expect("could not cancel goal");
+                                    } else {
+                                        println!("cancel dashboard future appears canceled");
+                                        let result_msg = ExecuteScript::Result { ok: false };
+                                        g.abort(result_msg).expect("could not cancel goal");
                                     }
                                 },
                                 Either::Right((res, _cancel_receiver)) => {
                                     // finished executing anyway
-                                    // todo: check res
                                     if let Ok(ok) = res {
                                         let result_msg = ExecuteScript::Result { ok };
                                         g.succeed(result_msg).expect("could not succeed goal");
+                                    } else {
+                                        println!("finished executing but future appears canceled");
+                                        let result_msg = ExecuteScript::Result { ok: false };
+                                        g.abort(result_msg).expect("could not cancel goal");
                                     }
                                 }
                             }
@@ -233,8 +250,10 @@ async fn realtime_reader(
 ) -> Result<(), std::io::Error> {
     let mut checking_for_1 = false;
     let mut checking_for_2_since = None;
-    let mut stream = connect_loop(&ur_address).await;
     let mut size_bytes = [0u8; 4];
+
+    let mut stream = connect_loop(&ur_address).await;
+    driver_state.lock().unwrap().connected = true;
 
     loop {
         let ret = timeout(
@@ -244,15 +263,18 @@ async fn realtime_reader(
         .await;
         // handle outer timeout error
         if let Err(_) = ret {
-            println!("timeout on read, reconnecting...");
-            stream = connect_loop(&ur_address).await;
             // reset state
             {
                 let mut ds = driver_state.lock().unwrap();
                 ds.goal_sender = None;
+                ds.connected = false;
             }
             checking_for_1 = false;
             checking_for_2_since = None;
+
+            println!("timeout on read, reconnecting... ");
+            stream = connect_loop(&ur_address).await;
+            driver_state.lock().unwrap().connected = true;
 
             continue;
         } else if let Ok(ret) = ret {
@@ -343,8 +365,8 @@ async fn realtime_reader(
             } else if program_running && checking_for_2 && checking_for_2_since.is_some() {
                 // we are currently waiting for program state == 2
                 let elapsed_since_request = checking_for_2_since.unwrap().elapsed();
-                if elapsed_since_request > std::time::Duration::from_millis(500) {
-                    // if there's been more than 500 millis without the program
+                if elapsed_since_request > std::time::Duration::from_millis(1000) {
+                    // if there's been more than 1000 millis without the program
                     // entering the running state, abort this request.
                     checking_for_2_since = None;
                     {
@@ -359,7 +381,8 @@ async fn realtime_reader(
 
             // when we have a goal, first wait until program_state reaches 2
             if program_running && program_state == 2 && !checking_for_1 {
-                println!("program started, waiting for finish");
+                let elapsed = checking_for_2_since.map(|t|t.elapsed().as_millis()).unwrap_or_default();
+                println!("program started after {}ms, waiting for finish", elapsed);
                 checking_for_1 = true;
                 checking_for_2_since = None;
             }
@@ -375,7 +398,6 @@ async fn realtime_reader(
                 {
                     let mut ds = driver_state.lock().unwrap();
                     if let Some(goal_sender) = ds.goal_sender.take() {
-                        println!("goal succeeded");
                         goal_sender.send(true).expect("goal receiver dropped");
                     } else {
                         println!("we fininshed but probably canceled the goal before...");
@@ -497,14 +519,16 @@ async fn dashboard(
     println!("robot model: {}", robot_model);
 
     // check that robot is in remote control
-    stream
-        .write_all(String::from("is in remote control\n").as_bytes())
-        .await?;
-    let mut line = String::new();
-    stream.read_line(&mut line).await?;
-    if !line.contains("true") {
-        return Err(Error::new(ErrorKind::Other, "must be in remote mode"));
-    }
+    // check commented out to work with simulator...
+    // stream
+    //     .write_all(String::from("is in remote control\n").as_bytes())
+    //     .await?;
+    // let mut line = String::new();
+    // stream.read_line(&mut line).await?;
+    // if !line.contains("true") {
+    //     println!("remote mode reply: {}", line);
+    //     return Err(Error::new(ErrorKind::Other, "must be in remote mode"));
+    // }
 
     loop {
         let (cmd, channel) = recv.recv().await.unwrap();
@@ -564,7 +588,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.to_owned()
     } else {
         // "192.168.2.125".to_owned()
-        "192.168.1.31".to_owned()
+        // "192.168.100.55".to_owned()
+        "192.168.100.12".to_owned()
     };
 
     let ur_dashboard_address = format!("{}:29999", ur_address);

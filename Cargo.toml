@@ -14,6 +14,7 @@ bytes = "0.5.4"
 hex = "0.4.2"
 lazy_static = "1.4.0"
 snailquote = "0.3.0"
+rand = "0.8.4"
 
 # speed up compilation
 [profile.release]
