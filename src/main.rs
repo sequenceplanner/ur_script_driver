@@ -428,15 +428,16 @@ async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
     joint_publisher: Publisher<sensor_msgs::msg::JointState>,
     measured_publisher: Publisher<ur_script_msgs::msg::Measured>,
+    prefix: String
 ) -> Result<(), std::io::Error> {
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime).unwrap();
     let joint_names = vec![
-        format!("shoulder_pan_joint"),
-        format!("shoulder_lift_joint"),
-        format!("elbow_joint"),
-        format!("wrist_1_joint"),
-        format!("wrist_2_joint"),
-        format!("wrist_3_joint"),
+        format!("{}shoulder_pan_joint", prefix),
+        format!("{}shoulder_lift_joint", prefix),
+        format!("{}elbow_joint", prefix),
+        format!("{}wrist_1_joint", prefix),
+        format!("{}wrist_2_joint", prefix),
+        format!("{}wrist_3_joint", prefix),
     ];
 
     loop {
@@ -592,6 +593,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "192.168.100.12".to_owned()
     };
 
+    let prefix = if let Some(ParameterValue::String(s)) = node.params
+        .lock().unwrap().get("prefix").as_ref()
+    {
+        s.to_owned()
+    } else {
+        "".to_owned()
+    };
+
     let ur_dashboard_address = format!("{}:29999", ur_address);
     let ur_address = format!("{}:30003", ur_address);
 
@@ -628,7 +637,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ur_address.to_owned(),
     );
     let state_publisher =
-        state_publisher(task_shared_state.clone(), joint_publisher, measured_publisher);
+        state_publisher(task_shared_state.clone(), joint_publisher, measured_publisher, prefix);
 
     let blocking_shared_state = task_shared_state.clone();
     let ros: JoinHandle<Result<(), Error>> = tokio::task::spawn_blocking(move || {
