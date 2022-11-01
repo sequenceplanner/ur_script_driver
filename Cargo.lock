@@ -486,8 +486,9 @@ dependencies = [
 
 [[package]]
 name = "r2r"
-version = "0.6.0"
-source = "git+https://github.com/sequenceplanner/r2r#a88505efd1cfb6cb98df860d70824e5a77e44d4a"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd15cdd7896978e06a87ddec84889fcf5d7d40f5143fb6ebf2c4f70a500aabb4"
 dependencies = [
  "futures",
  "lazy_static",
@@ -495,7 +496,6 @@ dependencies = [
  "r2r_common",
  "r2r_msg_gen",
  "r2r_rcl",
- "retain_mut",
  "serde",
  "serde_json",
  "thiserror",
@@ -504,11 +504,11 @@ dependencies = [
 
 [[package]]
 name = "r2r_actions"
-version = "0.3.0"
-source = "git+https://github.com/sequenceplanner/r2r#a88505efd1cfb6cb98df860d70824e5a77e44d4a"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8edc692318136cf94e6e77c5ef49c29b99a53439e79c9d6bbe693da107329f21"
 dependencies = [
  "bindgen",
- "itertools",
  "r2r_common",
  "r2r_msg_gen",
  "r2r_rcl",
@@ -516,13 +516,19 @@ dependencies = [
 
 [[package]]
 name = "r2r_common"
-version = "0.3.0"
-source = "git+https://github.com/sequenceplanner/r2r#a88505efd1cfb6cb98df860d70824e5a77e44d4a"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d28504e3cef5ba0dfa50febc734c6126443896ed1c50addc3f216e31b713d41f"
+dependencies = [
+ "bindgen",
+ "itertools",
+]
 
 [[package]]
 name = "r2r_msg_gen"
-version = "0.3.0"
-source = "git+https://github.com/sequenceplanner/r2r#a88505efd1cfb6cb98df860d70824e5a77e44d4a"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "397bbb65a304bf2467178fcc91f9ab111bd2d0608c098c116c9e3399c9bd388a"
 dependencies = [
  "bindgen",
  "heck",
@@ -533,11 +539,11 @@ dependencies = [
 
 [[package]]
 name = "r2r_rcl"
-version = "0.3.0"
-source = "git+https://github.com/sequenceplanner/r2r#a88505efd1cfb6cb98df860d70824e5a77e44d4a"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d363f4a9b1119e367fbbfbe68164674d782adf8d5d11ba73c65d6ded9028f74"
 dependencies = [
  "bindgen",
- "itertools",
  "paste",
  "r2r_common",
  "widestring",
@@ -608,12 +614,6 @@ name = "regex-syntax"
 version = "0.6.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f497285884f3fcff424ffc933e56d7cbca511def0c9831a7f9b5f6153e3cc89b"
-
-[[package]]
-name = "retain_mut"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11000e6ba5020e53e7cc26f73b91ae7d5496b4977851479edb66b694c0675c21"
 
 [[package]]
 name = "rustc-hash"
