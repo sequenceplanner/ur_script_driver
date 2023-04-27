@@ -6,16 +6,17 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# We use a custom profile to keep colcon
+# separate from "normal" rust building.
+[profile.colcon]
+inherits = "release"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-r2r = "0.6.3"
+r2r = "0.7.0"
 futures = "0.3.5"
 bytes = "0.5.4"
 hex = "0.4.2"
 lazy_static = "1.4.0"
 snailquote = "0.3.0"
 rand = "0.8.4"
-
-# speed up compilation
-[profile.release]
-opt-level = 0 # defaults to 3.

@@ -11,13 +11,11 @@ r2r_cargo(sensor_msgs
           ur_script_msgs
           rcl
           rcl_action
-          rmw_fastrtps_cpp       # (needed to build with RMW_IMPLEMENTATION=rmw_fastrtps_cpp)
-          FastRTPS               # (needed to build with RMW_IMPLEMENTATION=rmw_fastrtps_cpp)
          )
 
 # install binaries
 install(PROGRAMS
-  ${CMAKE_SOURCE_DIR}/target/release/${PROJECT_NAME}
+  ${CMAKE_SOURCE_DIR}/target/colcon/${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}
 )
 
