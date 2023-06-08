@@ -1,16 +1,17 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
 use r2r::{Context, Node, ParameterValue, Publisher, ServiceRequest};
-use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::net::SocketAddr;
 use futures::stream::{Stream, StreamExt};
 use futures::future::{self, Either};
+use futures::SinkExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::codec::{Framed, LinesCodec};
 use ur_script_msgs::action::ExecuteScript;
 use ur_script_msgs::srv::DashboardCommand as DBCommand;
 
@@ -79,7 +80,7 @@ impl DriverState {
 async fn handle_dashboard_commands(
     mut service: impl Stream<Item = ServiceRequest<DBCommand::Service>> + Unpin,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
-)  -> Result<(), std::io::Error> {
+)  -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match service.next().await {
             Some(req) => {
@@ -109,7 +110,7 @@ async fn action_server(
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     mut requests: impl Stream<Item = r2r::ActionServerGoalRequest<ExecuteScript::Action>> + Unpin,
-) -> Result<(), std::io::Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match requests.next().await {
             Some(req) => {
@@ -132,7 +133,7 @@ async fn action_server(
                 }
 
                 println!(
-                    "Accepting goal request with goal id: {}, script '{}'",
+                    "Accepting goal request with goal id: {}, script\n{}",
                     req.uuid, req.goal.script
                 );
 
@@ -145,10 +146,10 @@ async fn action_server(
                     Ok(write_stream) => write_stream,
                     Err(_) => {
                         println!("could not connect to realtime port for writing");
-                        return Err(Error::new(ErrorKind::Other, "oh no!"));
+                        return Err("oh no".into());
                     }
                 };
-                println!("writing data to driver {}", g.goal.script);
+                println!("writing data to driver\n{}", g.goal.script);
                 write_stream.write_all(g.goal.script.as_bytes()).await?;
                 write_stream.flush().await?;
 
@@ -233,7 +234,9 @@ async fn connect_loop(address: &str) -> TcpStream {
         let ret = TcpStream::connect(address).await;
         match ret {
             Ok(s) => {
-                println!("connected to: {}", address);
+                let local_address = s.local_addr().expect("could net get local address");
+                let peer_address = s.peer_addr().expect("could net get local address");
+                println!("connected to: {} with host ip {}", peer_address, local_address);
                 return s;
             }
             Err(e) => {
@@ -244,15 +247,78 @@ async fn connect_loop(address: &str) -> TcpStream {
     }
 }
 
+
+async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
+                       mut local_addr: watch::Receiver<Option<SocketAddr>>) -> Result<(), Box<dyn std::error::Error>> {
+
+    // listen to local ip, on port 50000
+    let mut addr = None;
+    while addr.is_none() {
+        local_addr.changed().await?;
+        addr = local_addr.borrow().clone();
+    }
+
+    let mut addr = addr.unwrap();
+    addr.set_port(50000);
+
+    println!("Starting socket server at {}", addr);
+
+    let listener = TcpListener::bind(&addr).await?;
+    loop {
+        // Asynchronously wait for an inbound TcpStream.
+        let (stream, addr) = listener.accept().await?;
+
+        println!("New connection: {}", addr);
+
+        // TODO: Only allow one active program at a time...
+
+        // perform initial handshake.
+        let mut lines = Framed::new(stream, LinesCodec::new());
+
+        // Send a prompt to the client to enter their username.
+        lines.send("go").await?;
+
+        // Read the first line from the `LineCodec` stream to get start status
+        match lines.next().await {
+            Some(Ok(s)) if s == "go".to_string() => {
+                println!("got GO, start UR script.");
+            },
+            _ => {
+                // TODO: handle failure here...
+                continue;
+            }
+        };
+
+        match lines.next().await {
+            Some(Ok(s)) if s == "ok".to_string() => {
+                println!("got OK, we are done.");
+            },
+            Some(Ok(s)) if s == "error".to_string() => {
+                println!("got ERROR, we are done.");
+            },
+            _ => {
+                // TODO: handle failure here...
+                continue;
+            }
+        };
+
+    }
+}
+
 async fn realtime_reader(
     driver_state: Arc<Mutex<DriverState>>,
     ur_address: String,
-) -> Result<(), std::io::Error> {
+    local_addr_sender: watch::Sender<Option<SocketAddr>>
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut checking_for_1 = false;
     let mut checking_for_2_since = None;
     let mut size_bytes = [0u8; 4];
 
     let mut stream = connect_loop(&ur_address).await;
+
+    let local_addr = stream.local_addr()?;
+    local_addr_sender.send(Some(local_addr))?;
+
     driver_state.lock().unwrap().connected = true;
 
     loop {
@@ -280,7 +346,7 @@ async fn realtime_reader(
         } else if let Ok(ret) = ret {
             if let Err(e) = ret {
                 println!("unexpected read error: {}", e);
-                return Err(Error::new(ErrorKind::Other, "oh no!"));
+                return Err("oh no".into());
             }
         }
         let msg_size = u32::from_be_bytes(size_bytes) as usize;
@@ -429,7 +495,7 @@ async fn state_publisher(
     joint_publisher: Publisher<sensor_msgs::msg::JointState>,
     measured_publisher: Publisher<ur_script_msgs::msg::Measured>,
     prefix: String
-) -> Result<(), std::io::Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime).unwrap();
     let joint_names = vec![
         format!("{}shoulder_pan_joint", prefix),
@@ -500,7 +566,7 @@ enum DashboardCommand {
 async fn dashboard(
     mut recv: tokio::sync::mpsc::Receiver<(DashboardCommand, oneshot::Sender<bool>)>,
     ur_address: String,
-) -> Result<(), std::io::Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = connect_loop(&ur_address).await;
     let mut stream = BufReader::new(stream);
 
@@ -508,7 +574,7 @@ async fn dashboard(
     let mut line = String::new();
     stream.read_line(&mut line).await?;
     if !line.contains("Connected: Universal Robots Dashboard Server") {
-        return Err(Error::new(ErrorKind::Other, "oh no!"));
+        return Err("oh no".into());
     }
 
     stream
@@ -568,7 +634,7 @@ async fn dashboard(
     }
 }
 
-async fn flatten_error<T>(handle: JoinHandle<Result<T, Error>>) -> Result<T, Error> {
+async fn flatten_error<T>(handle: JoinHandle<Result<T, Box<dyn std::error::Error + Send>>>) -> Result<T, Box<dyn std::error::Error>> {
     match handle.await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => Err(err),
@@ -590,7 +656,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // "192.168.2.125".to_owned()
         // "192.168.100.55".to_owned()
-        "192.168.100.12".to_owned()
+        // "192.168.100.12".to_owned()
+        "192.168.1.31".to_owned()
     };
 
     let prefix = if let Some(ParameterValue::String(s)) = node.params
@@ -632,25 +699,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let task_shared_state = shared_state.clone();
 
+    let (local_addr_sender, local_addr_receiver) = watch::channel(None);
+
     let realtime_reader = realtime_reader(
         task_shared_state.clone(),
         ur_address.to_owned(),
+        local_addr_sender,
     );
     let state_publisher =
         state_publisher(task_shared_state.clone(), joint_publisher, measured_publisher, prefix);
 
     let blocking_shared_state = task_shared_state.clone();
-    let ros: JoinHandle<Result<(), Error>> = tokio::task::spawn_blocking(move || {
+    let ros: JoinHandle<Result<(), Box<dyn std::error::Error + Send>>> = tokio::task::spawn_blocking(move || {
         while blocking_shared_state.lock().unwrap().running {
             node.spin_once(std::time::Duration::from_millis(8));
         }
         Ok(())
     });
 
+    let socket_server = socket_server(task_shared_state.clone(), local_addr_receiver);
+
     let dashboard = dashboard(rx_dashboard, ur_dashboard_address.to_owned());
     let ret = tokio::try_join!(
         action_task,
         realtime_reader,
+        socket_server,
         dashboard,
         state_publisher,
         dashboard_task,
@@ -659,7 +732,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match ret {
         Err(e) => {
             (*task_shared_state.lock().unwrap()).running = false;
-            return Err(Box::new(e));
+            return Err(e.into());
         }
         Ok(_) => {
             // will never get here.

@@ -4,8 +4,46 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn test_script() -> Result<(), Box<dyn std::error::Error>> {
-    let ur_script = format!("def script():\n  movej([0.0,0.0,0.0,-1.62,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
-    let ur_script2 = format!("def script():\n  movej([-0.44,-0.75,1.16,-1.9,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
+    let ur_script = format!("def script():\nmovej([0.0,0.0,0.0,-1.62,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
+    let ur_script2 = format!("def script():\nmovej([-0.44,-0.75,1.16,-1.9,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
+    let ur_script3 = format!("def handshake():\n  socket_open(\"192.168.1.134\", 50000, \"socket_10\")\n  line_from_server = socket_read_line(\"socket_10\")\n  socket_send_line(\"go\", \"socket_10\")\nend\n\ndef script():\n  handshake()\n  socket_close(\"socket_10\")\nend\n\nscript()\n");
+
+    let generated_script = r#"def script():
+  sleep(2.0)
+  return False
+end
+"#.to_string();
+
+    let indented_script: String = generated_script.lines().map(|l| format!("  {l}")).collect::<Vec<String>>().join("\n");
+
+    let pre_script = r#"
+def run_script():
+"#.to_string();
+
+    let post_script = r#"
+
+  def handshake():
+    socket_open("192.168.1.134", 50000, "socket_10")
+    line_from_server = socket_read_line("socket_10")
+    socket_send_line("go", "socket_10")
+  end
+
+  handshake()
+  result = script()
+  if(result):
+    socket_send_line("ok", "socket_10")
+  else:
+    socket_send_line("error", "socket_10")
+  end
+
+  socket_close("socket_10")
+end
+
+run_script()
+"#.to_string();
+
+    let ur_script3 = format!("{}{}{}", pre_script, indented_script, post_script);
+
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "testnode", "")?;
@@ -21,11 +59,12 @@ async fn test_script() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut s = &ur_script;
         loop {
-            if s == &ur_script {
-                s = &ur_script2;
-            } else {
-                s = &ur_script;
-            }
+            // if s == &ur_script {
+            //     s = &ur_script2;
+            // } else {
+            //     s = &ur_script;
+            // }
+            s = &ur_script3;
             let goal = ExecuteScript::Goal { script: s.to_string() };
             println!("sending goal: {:?}", goal);
             let res = client
@@ -48,16 +87,16 @@ async fn test_script() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }));
 
-                if rand::random::<bool>() { // && rand::random::<bool>() {
-                    // move a bit before sending cancel.
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    let r = goal.cancel().expect("could not send cancel request").await;
-                    if let Ok(()) = r {
-                        println!("goal cancelled successfully.");
-                    } else {
-                        println!("failed to cancel goal: {:?}", r);
-                    }
-                }
+                // if rand::random::<bool>() { // && rand::random::<bool>() {
+                //     // move a bit before sending cancel.
+                //     tokio::time::sleep(Duration::from_millis(1000)).await;
+                //     let r = goal.cancel().expect("could not send cancel request").await;
+                //     if let Ok(()) = r {
+                //         println!("goal cancelled successfully.");
+                //     } else {
+                //         println!("failed to cancel goal: {:?}", r);
+                //     }
+                // }
 
                 // await result in this task
                 match result.await {
@@ -71,6 +110,7 @@ async fn test_script() -> Result<(), Box<dyn std::error::Error>> {
                 // wait a bit to give server time to recover
                 tokio::time::sleep(Duration::from_millis(2000)).await;
             }
+            break;
         }
     });
 
