@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::task::LocalPoolHandle;
 use ur_script_msgs::action::ExecuteScript;
 use ur_script_msgs::srv::DashboardCommand as DBCommand;
 
@@ -144,12 +145,152 @@ run_script()
     return format!("{}{}{}", pre_script, indented_script, post_script);
 }
 
+async fn handle_request(
+    ur_address: String,
+    driver_state: Arc<Mutex<DriverState>>,
+    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
+    mut g: r2r::ActionServerGoal<ExecuteScript::Action>,
+    mut cancel: impl Stream<Item = r2r::ActionServerCancelRequest> + Unpin)
+    -> Result<(), Box<dyn std::error::Error>> {
+    let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
+
+    println!("making a new connection to the driver.");
+    let conn = TcpStream::connect(&ur_address).await;
+    let mut write_stream = match conn {
+        Ok(write_stream) => write_stream,
+        Err(_) => {
+            println!("could not connect to realtime port for writing");
+            return Err("oh no".into());
+        }
+    };
+
+    // Append stuff to the script...
+    let script_to_write = generate_ur_script(&g.goal.script);
+
+    println!("writing data to driver\n{}", script_to_write);
+    write_stream.write_all(script_to_write.as_bytes()).await?;
+    write_stream.flush().await?;
+
+    let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
+
+    {
+        let mut ds = driver_state.lock().unwrap();
+        ds.goal_id = Some(g.uuid.to_string());
+        ds.goal_sender = Some(goal_sender);
+        ds.feedback_sender = Some(feedback_sender);
+    }
+
+    let publish_feedback_fut = async {
+        loop {
+            match feedback_receiver.recv().await {
+                Some(msg) => {
+                    let mut feedback_msg = ur_script_msgs::action::ExecuteScript::Feedback::default();
+                    feedback_msg.feedback = msg;
+                    g.publish_feedback(feedback_msg)?
+                },
+                None => {
+                    return Result::<(), Box<dyn std::error::Error>>::Ok(())
+                },
+            }
+        }
+    };
+
+    let nominal = Box::pin(async { futures::join!(goal_receiver, publish_feedback_fut) }).fuse();
+
+    enum ResultType { ABORTED, CANCELED, SUCCEDED }
+    let (result_msg, result_type) = match future::select(nominal, cancel.next()).await {
+        Either::Left(((res, _), _cancel_stream)) => {
+            // success.
+            if let Ok(ok) = res {
+                println!("goal completed. result: {}", ok);
+                let result_msg = ExecuteScript::Result { ok };
+                // TODO: perhaps g.abort here if ok is false.
+                (result_msg, ResultType::SUCCEDED)
+            } else {
+                println!("future appears canceled, abort.");
+                let result_msg = ExecuteScript::Result { ok: false };
+                (result_msg, ResultType::ABORTED)
+            }
+        },
+        Either::Right((request, nominal)) => {
+            if let Some(request) = request {
+                println!("got cancel request: {}", request.uuid);
+                request.accept();
+
+                // this starts a race between completing
+                // the motion and cancelling via stopping.
+                // goal removal is done by the one that
+                // succeeds first.
+                let (sender, cancel_receiver) = oneshot::channel();
+                dashboard_commands
+                    .try_send((DashboardCommand::Stop, sender))
+                    .expect("could not send...");
+
+                match future::select(cancel_receiver, nominal).await {
+                    Either::Left((res, _nominal)) => {
+                        // cancelled using dashboard
+                        if let Ok(ok) = res {
+                            let result_msg = ExecuteScript::Result { ok };
+                            (result_msg, ResultType::CANCELED)
+                        } else {
+                            println!("cancel dashboard future appears canceled");
+                            let result_msg = ExecuteScript::Result { ok: false };
+                            (result_msg, ResultType::ABORTED)
+                        }
+                    },
+                    Either::Right(((res, _), _cancel_receiver)) => {
+                        // finished executing before cancellation was complete
+                        if let Ok(ok) = res {
+                            println!("goal completed. result: {}", ok);
+                            let result_msg = ExecuteScript::Result { ok };
+                            (result_msg, ResultType::SUCCEDED)
+                        } else {
+                            println!("finished executing but future is canceled.");
+                            let result_msg = ExecuteScript::Result { ok: false };
+                            (result_msg, ResultType::ABORTED)
+                        }
+                    }
+                }
+            } else {
+                let result_msg = ExecuteScript::Result { ok: false };
+                println!("got cancel but sender seem dropped");
+                (result_msg, ResultType::ABORTED)
+            }
+        }
+    };
+
+    match result_type {
+        ResultType::ABORTED => {
+            g.abort(result_msg).expect("could not abort goal");
+        },
+        ResultType::CANCELED => {
+            g.cancel(result_msg).expect("could not cancel goal");
+        }
+        ResultType::SUCCEDED => {
+            g.succeed(result_msg).expect("could not succeed goal");
+        }
+    }
+
+    // at this point we have processed this goal
+    {
+        let mut ds = driver_state.lock().unwrap();
+        ds.goal_id = None;
+        ds.goal_sender = None;
+    }
+
+    Ok(())
+}
+
 async fn action_server(
     ur_address: String,
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     mut requests: impl Stream<Item = r2r::ActionServerGoalRequest<ExecuteScript::Action>> + Unpin,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    // we need this to spawn the goal onto a single thread since its not sync...
+    let local_pool = LocalPoolHandle::new(1);
+
     loop {
         match requests.next().await {
             Some(req) => {
@@ -185,132 +326,22 @@ async fn action_server(
                     req.uuid, req.goal.script
                 );
 
-                let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
-                let (mut g, mut cancel) = req.accept().expect("could not accept goal");
+                let (g, cancel) = req.accept().expect("could not accept goal");
 
-                println!("making a new connection to the driver.");
-                let conn = TcpStream::connect(&ur_address).await;
-                let mut write_stream = match conn {
-                    Ok(write_stream) => write_stream,
-                    Err(_) => {
-                        println!("could not connect to realtime port for writing");
-                        return Err("oh no".into());
+                let task_ur_address = ur_address.clone();
+                let task_dashboard_commands = dashboard_commands.clone();
+                let task_driver_state = driver_state.clone();
+                local_pool.spawn_pinned(move || async {
+                    let result = handle_request(task_ur_address,
+                                                task_driver_state,
+                                                task_dashboard_commands,
+                                                g,
+                                                cancel,
+                    ).await;
+                    if let Err(e) = result {
+                        println!("Error while handing goal: {}", e);
                     }
-                };
-
-                // Append stuff to the script...
-                let script_to_write = generate_ur_script(&g.goal.script);
-
-                println!("writing data to driver\n{}", script_to_write);
-                write_stream.write_all(script_to_write.as_bytes()).await?;
-                write_stream.flush().await?;
-
-                let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
-
-                {
-                    let mut ds = driver_state.lock().unwrap();
-                    ds.goal_id = Some(g.uuid.to_string());
-                    ds.goal_sender = Some(goal_sender);
-                    ds.feedback_sender = Some(feedback_sender);
-                }
-
-                let publish_feedback_fut = async {
-                    loop {
-                        match feedback_receiver.recv().await {
-                            Some(msg) => {
-                                let mut feedback_msg = ur_script_msgs::action::ExecuteScript::Feedback::default();
-                                feedback_msg.feedback = msg;
-                                g.publish_feedback(feedback_msg).expect("test");
-                            },
-                            None => {
-                                break;
-                            },
-                        }
-                    }
-                };
-
-                let nominal = Box::pin(async { futures::join!(goal_receiver, publish_feedback_fut) }).fuse();
-
-                enum ResultType { ABORTED, CANCELED, SUCCEDED }
-                let (result_msg, result_type) = match future::select(nominal, cancel.next()).await {
-                    Either::Left(((res, _), _cancel_stream)) => {
-                        // success.
-                        if let Ok(ok) = res {
-                            println!("goal completed. result: {}", ok);
-                            let result_msg = ExecuteScript::Result { ok };
-                            // TODO: perhaps g.abort here if ok is false.
-                            (result_msg, ResultType::SUCCEDED)
-                        } else {
-                            println!("future appears canceled, abort.");
-                            let result_msg = ExecuteScript::Result { ok: false };
-                            (result_msg, ResultType::ABORTED)
-                        }
-                    },
-                    Either::Right((request, nominal)) => {
-                        if let Some(request) = request {
-                            println!("got cancel request: {}", request.uuid);
-                            request.accept();
-
-                            // this starts a race between completing
-                            // the motion and cancelling via stopping.
-                            // goal removal is done by the one that
-                            // succeeds first.
-                            let (sender, cancel_receiver) = oneshot::channel();
-                            dashboard_commands
-                                .try_send((DashboardCommand::Stop, sender))
-                                .expect("could not send...");
-
-                            match future::select(cancel_receiver, nominal).await {
-                                Either::Left((res, _nominal)) => {
-                                    // cancelled using dashboard
-                                    if let Ok(ok) = res {
-                                        let result_msg = ExecuteScript::Result { ok };
-                                        (result_msg, ResultType::CANCELED)
-                                    } else {
-                                        println!("cancel dashboard future appears canceled");
-                                        let result_msg = ExecuteScript::Result { ok: false };
-                                        (result_msg, ResultType::ABORTED)
-                                    }
-                                },
-                                Either::Right(((res, _), _cancel_receiver)) => {
-                                    // finished executing before cancellation was complete
-                                    if let Ok(ok) = res {
-                                        println!("goal completed. result: {}", ok);
-                                        let result_msg = ExecuteScript::Result { ok };
-                                        (result_msg, ResultType::SUCCEDED)
-                                    } else {
-                                        println!("finished executing but future is canceled.");
-                                        let result_msg = ExecuteScript::Result { ok: false };
-                                        (result_msg, ResultType::ABORTED)
-                                    }
-                                }
-                            }
-                        } else {
-                            let result_msg = ExecuteScript::Result { ok: false };
-                            println!("got cancel but sender seem dropped");
-                            (result_msg, ResultType::ABORTED)
-                        }
-                    }
-                };
-
-                match result_type {
-                    ResultType::ABORTED => {
-                        g.abort(result_msg).expect("could not abort goal");
-                    },
-                    ResultType::CANCELED => {
-                        g.cancel(result_msg).expect("could not cancel goal");
-                    }
-                    ResultType::SUCCEDED => {
-                        g.succeed(result_msg).expect("could not succeed goal");
-                    }
-                }
-
-                // at this point we have processed this goal
-                {
-                    let mut ds = driver_state.lock().unwrap();
-                    ds.goal_id = None;
-                    ds.goal_sender = None;
-                }
+                });
             }
             None => break,
         }
