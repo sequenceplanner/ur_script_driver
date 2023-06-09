@@ -4,46 +4,33 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn test_script() -> Result<(), Box<dyn std::error::Error>> {
-    let ur_script = format!("def script():\nmovej([0.0,0.0,0.0,-1.62,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
-    let ur_script2 = format!("def script():\nmovej([-0.44,-0.75,1.16,-1.9,-1.57,0.0], a=0.5, v=0.5)\nend\n\nscript()\n");
-    let ur_script3 = format!("def handshake():\n  socket_open(\"192.168.1.134\", 50000, \"socket_10\")\n  line_from_server = socket_read_line(\"socket_10\")\n  socket_send_line(\"go\", \"socket_10\")\nend\n\ndef script():\n  handshake()\n  socket_close(\"socket_10\")\nend\n\nscript()\n");
-
-    let generated_script = r#"def script():
-  sleep(2.0)
-  return False
+    let ur_script1 = r#"def script():
+  movej([0.0,0.0,0.0,-1.62,-1.57,0.0], a=0.20, v=0.25)
+  return True
 end
 "#.to_string();
 
-    let indented_script: String = generated_script.lines().map(|l| format!("  {l}")).collect::<Vec<String>>().join("\n");
-
-    let pre_script = r#"
-def run_script():
-"#.to_string();
-
-    let post_script = r#"
-
-  def handshake():
-    socket_open("192.168.1.134", 50000, "socket_10")
-    line_from_server = socket_read_line("socket_10")
-    socket_send_line("go", "socket_10")
-  end
-
-  handshake()
-  result = script()
-  if(result):
-    socket_send_line("ok", "socket_10")
-  else:
-    socket_send_line("error", "socket_10")
-  end
-
-  socket_close("socket_10")
+    let ur_script2 = r#"def script():
+  movej([-0.44,-0.75,1.16,-1.9,-1.57,0.0], a=0.2, v=0.25)
+  return True
 end
-
-run_script()
 "#.to_string();
 
-    let ur_script3 = format!("{}{}{}", pre_script, indented_script, post_script);
-
+    let ur_script3 = r#"
+def script():
+  socket_send_line("sleeping 1...", "ur_driver_socket")
+  sleep(1.0)
+  socket_send_line("sleeping 2...", "ur_driver_socket")
+  sleep(1.0)
+  socket_send_line("sleeping 3...", "ur_driver_socket")
+  sleep(1.0)
+  socket_send_line("sleeping 4...", "ur_driver_socket")
+  sleep(1.0)
+  socket_send_line("sleeping 5...", "ur_driver_socket")
+  sleep(1.0)
+  return True
+end
+"#.to_string();
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "testnode", "")?;
@@ -57,16 +44,11 @@ run_script()
             .expect("could not await action server");
         println!("action service available.");
 
-        let mut s = &ur_script;
+        let mut s = &ur_script1;
         loop {
-            // if s == &ur_script {
-            //     s = &ur_script2;
-            // } else {
-            //     s = &ur_script;
-            // }
-            s = &ur_script3;
             let goal = ExecuteScript::Goal { script: s.to_string() };
-            println!("sending goal: {:?}", goal);
+            println!("***************************************");
+            println!("sending goal");
             let res = client
                 .send_goal_request(goal)
                 .expect("could not send goal request")
@@ -75,33 +57,44 @@ run_script()
             if let Ok((goal, result, feedback)) = res {
                 println!("goal accepted: {}", goal.uuid);
                 // process feedback stream in its own task
-                let nested_goal = goal.clone();
                 tokio::spawn(feedback.for_each(move |msg| {
-                        let nested_goal = nested_goal.clone();
                         async move {
-                            println!(
-                                "new feedback msg {:?} -- {:?}",
-                                msg,
-                                nested_goal.get_status()
-                            );
+                            println!("got feedback msg: {}", msg.feedback);
                         }
                     }));
 
-                // if rand::random::<bool>() { // && rand::random::<bool>() {
-                //     // move a bit before sending cancel.
-                //     tokio::time::sleep(Duration::from_millis(1000)).await;
-                //     let r = goal.cancel().expect("could not send cancel request").await;
-                //     if let Ok(()) = r {
-                //         println!("goal cancelled successfully.");
-                //     } else {
-                //         println!("failed to cancel goal: {:?}", r);
-                //     }
-                // }
+                if rand::random::<bool>() && rand::random::<bool>() {
+                    println!("Will cancel this action...");
+                    // move a bit before sending cancel.
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    println!("Sending cancel now...");
+                    let r = goal.cancel().expect("could not send cancel request").await;
+                    if let Ok(()) = r {
+                        println!("goal cancelled successfully.");
+                    } else {
+                        println!("failed to cancel goal: {:?}", r);
+                    }
+                    // wait a bit when cancelling to see effect
+                    tokio::time::sleep(Duration::from_millis(5000)).await;
+                }
 
                 // await result in this task
                 match result.await {
                     Ok((status, msg)) => {
-                        println!("got result {} with msg {:?}", status, msg);
+                        println!("Got result {}: {}", status, msg.ok);
+
+                        // if success we change ur program.
+                        if status == r2r::GoalStatus::Succeeded && msg.ok {
+                            if s == &ur_script1 {
+                                s = &ur_script2;
+                            } else if s == &ur_script2 {
+                                s = &ur_script3;
+                            } else {
+                                s = &ur_script1;
+                            }
+                        } else {
+                            println!("Execution failed, running the same program again...");
+                        }
                     }
                     Err(e) => println!("action failed: {:?}", e),
                 }
@@ -110,7 +103,6 @@ run_script()
                 // wait a bit to give server time to recover
                 tokio::time::sleep(Duration::from_millis(2000)).await;
             }
-            break;
         }
     });
 

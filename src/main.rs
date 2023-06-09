@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::net::SocketAddr;
 use futures::stream::{Stream, StreamExt};
 use futures::future::{self, Either};
-use futures::SinkExt;
+use futures::{SinkExt,FutureExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -15,12 +15,16 @@ use tokio_util::codec::{Framed, LinesCodec};
 use ur_script_msgs::action::ExecuteScript;
 use ur_script_msgs::srv::DashboardCommand as DBCommand;
 
+const UR_DRIVER_SOCKET_PORT: u16 = 50000;
+
 struct DriverState {
     running: bool,
     connected: bool,
     // only handle one goal at the time. reply with true/false if
     // script executed successfully.
+    goal_id: Option<String>,
     goal_sender: Option<oneshot::Sender<bool>>,
+    feedback_sender: Option<mpsc::Sender<String>>,
     robot_state: i32,
     program_state: i32,
     joint_values: Vec<f64>,
@@ -50,7 +54,9 @@ impl DriverState {
         DriverState {
             running: true,
             connected: false,
+            goal_id: None,
             goal_sender: None,
+            feedback_sender: None,
             robot_state: 0,
             program_state: 0,
             joint_values: vec![],
@@ -105,6 +111,39 @@ async fn handle_dashboard_commands(
     Ok(())
 }
 
+
+fn generate_ur_script(original: &str) -> String {
+    let indented_script: String = original.lines().map(|l| format!("  {l}")).collect::<Vec<String>>().join("\n");
+
+    let pre_script = r#"
+def run_script():
+"#.to_string();
+
+    let post_script = r#"
+
+  def handshake():
+    socket_open("192.168.1.134", 50000, "ur_driver_socket")
+    line_from_server = socket_read_line("ur_driver_socket")
+    socket_send_line(line_from_server, "ur_driver_socket")
+  end
+
+  handshake()
+  result = script()
+  if(result):
+    socket_send_line("ok", "ur_driver_socket")
+  else:
+    socket_send_line("error", "ur_driver_socket")
+  end
+
+  socket_close("ur_driver_socket")
+end
+
+run_script()
+"#.to_string();
+
+    return format!("{}{}{}", pre_script, indented_script, post_script);
+}
+
 async fn action_server(
     ur_address: String,
     driver_state: Arc<Mutex<DriverState>>,
@@ -132,6 +171,15 @@ async fn action_server(
                     continue;
                 }
 
+                if let Some(goal_id) = driver_state.lock().unwrap().goal_id.as_ref().clone() {
+                    println!(
+                        "Already have a goal (id: {}), rejecting request with goal id: {}, script: '{}'",
+                        goal_id, req.uuid, req.goal.script
+                    );
+                    req.reject().expect("could not reject goal");
+                    continue;
+                }
+
                 println!(
                     "Accepting goal request with goal id: {}, script\n{}",
                     req.uuid, req.goal.script
@@ -149,30 +197,56 @@ async fn action_server(
                         return Err("oh no".into());
                     }
                 };
-                println!("writing data to driver\n{}", g.goal.script);
-                write_stream.write_all(g.goal.script.as_bytes()).await?;
+
+                // Append stuff to the script...
+                let script_to_write = generate_ur_script(&g.goal.script);
+
+                println!("writing data to driver\n{}", script_to_write);
+                write_stream.write_all(script_to_write.as_bytes()).await?;
                 write_stream.flush().await?;
+
+                let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
 
                 {
                     let mut ds = driver_state.lock().unwrap();
+                    ds.goal_id = Some(g.uuid.to_string());
                     ds.goal_sender = Some(goal_sender);
+                    ds.feedback_sender = Some(feedback_sender);
                 }
 
-                match future::select(goal_receiver, cancel.next()).await {
-                    Either::Left((res, _cancel_stream)) => {
+                let publish_feedback_fut = async {
+                    loop {
+                        match feedback_receiver.recv().await {
+                            Some(msg) => {
+                                let mut feedback_msg = ur_script_msgs::action::ExecuteScript::Feedback::default();
+                                feedback_msg.feedback = msg;
+                                g.publish_feedback(feedback_msg).expect("test");
+                            },
+                            None => {
+                                break;
+                            },
+                        }
+                    }
+                };
+
+                let nominal = Box::pin(async { futures::join!(goal_receiver, publish_feedback_fut) }).fuse();
+
+                enum ResultType { ABORTED, CANCELED, SUCCEDED }
+                let (result_msg, result_type) = match future::select(nominal, cancel.next()).await {
+                    Either::Left(((res, _), _cancel_stream)) => {
                         // success.
                         if let Ok(ok) = res {
-                            println!("goal completed? {}", ok);
+                            println!("goal completed. result: {}", ok);
                             let result_msg = ExecuteScript::Result { ok };
                             // TODO: perhaps g.abort here if ok is false.
-                            g.succeed(result_msg).expect("could not send result");
+                            (result_msg, ResultType::SUCCEDED)
                         } else {
-                            println!("future appears canceled...");
+                            println!("future appears canceled, abort.");
                             let result_msg = ExecuteScript::Result { ok: false };
-                            g.abort(result_msg).expect("task cancelled");
+                            (result_msg, ResultType::ABORTED)
                         }
                     },
-                    Either::Right((request, goal_receiver)) => {
+                    Either::Right((request, nominal)) => {
                         if let Some(request) = request {
                             println!("got cancel request: {}", request.uuid);
                             request.accept();
@@ -186,36 +260,57 @@ async fn action_server(
                                 .try_send((DashboardCommand::Stop, sender))
                                 .expect("could not send...");
 
-                            match future::select(cancel_receiver, goal_receiver).await {
-                                Either::Left((res, _goal_receiver)) => {
+                            match future::select(cancel_receiver, nominal).await {
+                                Either::Left((res, _nominal)) => {
                                     // cancelled using dashboard
                                     if let Ok(ok) = res {
                                         let result_msg = ExecuteScript::Result { ok };
-                                        g.cancel(result_msg).expect("could not cancel goal");
+                                        (result_msg, ResultType::CANCELED)
                                     } else {
                                         println!("cancel dashboard future appears canceled");
                                         let result_msg = ExecuteScript::Result { ok: false };
-                                        g.abort(result_msg).expect("could not cancel goal");
+                                        (result_msg, ResultType::ABORTED)
                                     }
                                 },
-                                Either::Right((res, _cancel_receiver)) => {
-                                    // finished executing anyway
+                                Either::Right(((res, _), _cancel_receiver)) => {
+                                    // finished executing before cancellation was complete
                                     if let Ok(ok) = res {
+                                        println!("goal completed. result: {}", ok);
                                         let result_msg = ExecuteScript::Result { ok };
-                                        g.succeed(result_msg).expect("could not succeed goal");
+                                        (result_msg, ResultType::SUCCEDED)
                                     } else {
-                                        println!("finished executing but future appears canceled");
+                                        println!("finished executing but future is canceled.");
                                         let result_msg = ExecuteScript::Result { ok: false };
-                                        g.abort(result_msg).expect("could not cancel goal");
+                                        (result_msg, ResultType::ABORTED)
                                     }
                                 }
                             }
+                        } else {
+                            let result_msg = ExecuteScript::Result { ok: false };
+                            println!("got cancel but sender seem dropped");
+                            (result_msg, ResultType::ABORTED)
                         }
                     }
                 };
 
-                // at this point we have processed the goal.
-                driver_state.lock().unwrap().goal_sender = None;
+                match result_type {
+                    ResultType::ABORTED => {
+                        g.abort(result_msg).expect("could not abort goal");
+                    },
+                    ResultType::CANCELED => {
+                        g.cancel(result_msg).expect("could not cancel goal");
+                    }
+                    ResultType::SUCCEDED => {
+                        g.succeed(result_msg).expect("could not succeed goal");
+                    }
+                }
+
+                // at this point we have processed this goal
+                {
+                    let mut ds = driver_state.lock().unwrap();
+                    ds.goal_id = None;
+                    ds.goal_sender = None;
+                }
             }
             None => break,
         }
@@ -249,9 +344,8 @@ async fn connect_loop(address: &str) -> TcpStream {
 
 
 async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
+                       dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
                        mut local_addr: watch::Receiver<Option<SocketAddr>>) -> Result<(), Box<dyn std::error::Error>> {
-
-    // listen to local ip, on port 50000
     let mut addr = None;
     while addr.is_none() {
         local_addr.changed().await?;
@@ -259,7 +353,7 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
     }
 
     let mut addr = addr.unwrap();
-    addr.set_port(50000);
+    addr.set_port(UR_DRIVER_SOCKET_PORT);
 
     println!("Starting socket server at {}", addr);
 
@@ -270,38 +364,121 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
 
         println!("New connection: {}", addr);
 
-        // TODO: Only allow one active program at a time...
+        // Only allow one active program at a time...
+        // Check that the UR-script identifies with the correct goal id.
+        // Otherwise we signal failure.
+
+        let (goal_id, feedback_sender) = {
+            let ds = driver_state.lock().unwrap();
+            (ds.goal_id.clone(), ds.feedback_sender.clone())
+        };
+        if goal_id.is_none() {
+            println!("SHOULD NOT HAPPEN, DROPPING STREAM");
+            continue;
+        }
+        if feedback_sender.is_none() {
+            println!("SHOULD NOT HAPPEN, DROPPING STREAM");
+            continue;
+        }
+        let goal_id = goal_id.unwrap();
+        let feedback_sender = feedback_sender.unwrap();
 
         // perform initial handshake.
         let mut lines = Framed::new(stream, LinesCodec::new());
 
-        // Send a prompt to the client to enter their username.
-        lines.send("go").await?;
+        // send goal id to ur script for handshaking.
+        lines.send(&goal_id).await?;
 
-        // Read the first line from the `LineCodec` stream to get start status
-        match lines.next().await {
-            Some(Ok(s)) if s == "go".to_string() => {
-                println!("got GO, start UR script.");
+
+        // read back the next line which should be the same goal id.
+        // if there's been more than 1000 millis without the program
+        // completing the handshaking, abort this request.
+        // (should also stop using dashboard server just in case.)
+        match timeout(Duration::from_millis(1000), lines.next()).await {
+            Err(_) => {
+                let mut ds = driver_state.lock().unwrap();
+                if let Some(goal_sender) = ds.goal_sender.take() {
+                    println!("handshake not performed in time, stopping!");
+                    goal_sender.send(false).expect("goal receiver dropped");
+                }
+                let (sender, cancel_receiver) = oneshot::channel();
+                dashboard_commands
+                    .try_send((DashboardCommand::Stop, sender))
+                    .expect("could not send...");
+                if let Err(e) = cancel_receiver.await {
+                    println!("No response from dashboard server {e}");
+                }
+                continue;
             },
-            _ => {
-                // TODO: handle failure here...
+            Ok(Some(Ok(s))) if s == goal_id => {
+                println!("got GO with correct GOAL ID, start UR script.");
+            },
+            Ok(_) => {
+                println!("got GO with incorrect GOAL ID, SHOULD NOT HAPPEN");
+                println!("Stopping execution via dashboard server");
+                // TODO: handle failure here by force stopping the ur script.
+                // can use dashboard server for that.
+                let (sender, cancel_receiver) = oneshot::channel();
+                dashboard_commands
+                    .try_send((DashboardCommand::Stop, sender))
+                    .expect("could not send...");
+                if let Err(e) = cancel_receiver.await {
+                    println!("No response from dashboard server {e}");
+                }
                 continue;
             }
         };
 
-        match lines.next().await {
-            Some(Ok(s)) if s == "ok".to_string() => {
-                println!("got OK, we are done.");
-            },
-            Some(Ok(s)) if s == "error".to_string() => {
-                println!("got ERROR, we are done.");
-            },
-            _ => {
-                // TODO: handle failure here...
-                continue;
-            }
-        };
+        let message = format!("Handshake complete, running script");
+        if let Err(e) = feedback_sender.send(message).await {
+            println!("could not send feedback message: {}", e);
+        }
 
+        loop {
+            match lines.next().await {
+                Some(Ok(s)) if s == "ok".to_string() => {
+                    println!("got OK, we are done.");
+
+                    // we are finished. succeed and remove the action goal handle.
+                    {
+                        let mut ds = driver_state.lock().unwrap();
+                        if let Some(goal_sender) = ds.goal_sender.take() {
+                            goal_sender.send(true).expect("goal receiver dropped");
+                        } else {
+                            println!("we fininshed but probably canceled the goal before...");
+                        }
+                    }
+                },
+                Some(Ok(s)) if s == "error".to_string() => {
+                    // we are finished. succeed and remove the action goal handle.
+                    println!("got ERROR, we are done.");
+                    {
+                        let mut ds = driver_state.lock().unwrap();
+                        if let Some(goal_sender) = ds.goal_sender.take() {
+                            goal_sender.send(false).expect("goal receiver dropped");
+                        } else {
+                            println!("we fininshed but probably canceled the goal before...");
+                        }
+                    }
+                },
+                Some(Ok(s)) => {
+                    // We got a line that is not ok or error,
+                    // this should be send out as a feedback message.
+                    println!("got {}, sending as feedback", s);
+                    if let Err(e) = feedback_sender.send(s).await {
+                        println!("could not send feedback message: {}", e);
+                    }
+                },
+                _ => {
+                    // TODO: handle failure here...
+                    println!("Socked connection closed, dropping feedback sender.");
+                    let mut ds = driver_state.lock().unwrap();
+                    ds.feedback_sender = None;
+
+                    break;
+                }
+            };
+        }
     }
 }
 
@@ -310,8 +487,6 @@ async fn realtime_reader(
     ur_address: String,
     local_addr_sender: watch::Sender<Option<SocketAddr>>
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut checking_for_1 = false;
-    let mut checking_for_2_since = None;
     let mut size_bytes = [0u8; 4];
 
     let mut stream = connect_loop(&ur_address).await;
@@ -329,15 +504,12 @@ async fn realtime_reader(
         .await;
         // handle outer timeout error
         if let Err(_) = ret {
-            // reset state
             {
+                // We no longer kill the goal here since we know the state of execution
+                // via the socket communication.
                 let mut ds = driver_state.lock().unwrap();
-                ds.goal_sender = None;
                 ds.connected = false;
             }
-            checking_for_1 = false;
-            checking_for_2_since = None;
-
             println!("timeout on read, reconnecting... ");
             stream = connect_loop(&ur_address).await;
             driver_state.lock().unwrap().connected = true;
@@ -396,7 +568,7 @@ async fn realtime_reader(
             // println!("program state {:?}", program_state);
 
             // update program state.
-            let program_running = {
+            {
                 let mut ds = driver_state.lock().unwrap();
                 (*ds).joint_values = joints;
                 (*ds).joint_speeds = speeds;
@@ -421,55 +593,7 @@ async fn realtime_reader(
                 (*ds).output_bit5 = digital_outputs & 32 == 32;
                 (*ds).output_bit6 = digital_outputs & 64 == 64;
                 (*ds).output_bit7 = digital_outputs & 128 == 128;
-                (*ds).goal_sender.is_some()
             };
-
-            let checking_for_2 = program_state == 1 && !checking_for_1;
-            if program_running && checking_for_2 && checking_for_2_since.is_none() {
-                // flank check for when we requested program (waiting for program state 2)
-                checking_for_2_since = Some(std::time::Instant::now());
-            } else if program_running && checking_for_2 && checking_for_2_since.is_some() {
-                // we are currently waiting for program state == 2
-                let elapsed_since_request = checking_for_2_since.unwrap().elapsed();
-                if elapsed_since_request > std::time::Duration::from_millis(1000) {
-                    // if there's been more than 1000 millis without the program
-                    // entering the running state, abort this request.
-                    checking_for_2_since = None;
-                    {
-                        let mut ds = driver_state.lock().unwrap();
-                        if let Some(goal_sender) = ds.goal_sender.take() {
-                            println!("program state never changed to running");
-                            goal_sender.send(false).expect("goal receiver dropped");
-                        }
-                    }
-                }
-            }
-
-            // when we have a goal, first wait until program_state reaches 2
-            if program_running && program_state == 2 && !checking_for_1 {
-                let elapsed = checking_for_2_since.map(|t|t.elapsed().as_millis()).unwrap_or_default();
-                println!("program started after {}ms, waiting for finish", elapsed);
-                checking_for_1 = true;
-                checking_for_2_since = None;
-            }
-
-            // when the program state has been 2 and goes back to
-            // 1, the goal has succeeded
-            if checking_for_1 && program_state == 1 {
-                println!("program started and has now finished");
-                // reset state machine
-                checking_for_1 = false;
-
-                // we are finished. succeed and remove the action goal handle.
-                {
-                    let mut ds = driver_state.lock().unwrap();
-                    if let Some(goal_sender) = ds.goal_sender.take() {
-                        goal_sender.send(true).expect("goal receiver dropped");
-                    } else {
-                        println!("we fininshed but probably canceled the goal before...");
-                    }
-                }
-            }
 
             if robot_state != 1 {
                 // robot has entered protective or emergency stop. If
@@ -478,12 +602,12 @@ async fn realtime_reader(
                 // handle.
                 {
                     let mut ds = driver_state.lock().unwrap();
-                    checking_for_1 = false;
-                    checking_for_2_since = None;
                     if let Some(goal_sender) = ds.goal_sender.take() {
                         println!("aborting due to protective stop");
                         goal_sender.send(false).expect("goal receiver dropped");
                     }
+                    ds.feedback_sender = None;
+                    ds.goal_id = None;
                 }
             }
         }
@@ -694,7 +818,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_state_action = shared_state.clone();
     let action_task = action_server(ur_address.to_owned(),
                                     shared_state_action,
-                                    tx_dashboard,
+                                    tx_dashboard.clone(),
                                     server_requests);
 
     let task_shared_state = shared_state.clone();
@@ -717,7 +841,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
 
-    let socket_server = socket_server(task_shared_state.clone(), local_addr_receiver);
+    let socket_server = socket_server(task_shared_state.clone(),
+                                      tx_dashboard,
+                                      local_addr_receiver);
 
     let dashboard = dashboard(rx_dashboard, ur_dashboard_address.to_owned());
     let ret = tokio::try_join!(
