@@ -113,27 +113,44 @@ async fn handle_dashboard_commands(
 }
 
 
-fn generate_ur_script(original: &str) -> String {
+/// Takes the original UR script to call and wraps it in handshaking
+/// using socket communication to the host (caller).
+fn generate_ur_script(original: &str, host_address: &str) -> String {
     let indented_script: String = original.lines().map(|l| format!("  {l}")).collect::<Vec<String>>().join("\n");
 
     let pre_script = r#"
 def run_script():
 "#.to_string();
 
-    let post_script = r#"
+    let post_script_1 = r#"
 
   def handshake():
-    socket_open("192.168.1.134", 50000, "ur_driver_socket")
-    line_from_server = socket_read_line("ur_driver_socket")
-    socket_send_line(line_from_server, "ur_driver_socket")
+"#.to_string();
+
+    let post_script_2 = format!("    socket_open(\"{}\", 50000, \"ur_driver_socket\")", host_address);
+
+    let post_script_3 = r#"
+    line_from_server = socket_read_line("ur_driver_socket", timeout=1.0)
+    if(str_empty(line_from_server)):
+      return False
+    else:
+      socket_send_line(line_from_server, "ur_driver_socket")
+      return True
+    end
   end
 
-  handshake()
-  result = script()
-  if(result):
-    socket_send_line("ok", "ur_driver_socket")
+  if(handshake()):
+    result = script()
+    if(result):
+      socket_send_line("ok", "ur_driver_socket")
+    else:
+      socket_send_line("error", "ur_driver_socket")
+    end
   else:
-    socket_send_line("error", "ur_driver_socket")
+"#.to_string();
+    let post_script_4 = format!("    popup(\"handshake failure with host {}, not moving.\")", host_address);
+
+    let post_script_5 = r#"
   end
 
   socket_close("ur_driver_socket")
@@ -142,11 +159,13 @@ end
 run_script()
 "#.to_string();
 
-    return format!("{}{}{}", pre_script, indented_script, post_script);
+    return format!("{}{}{}{}{}{}{}", pre_script, indented_script, post_script_1,
+                   post_script_2, post_script_3, post_script_4, post_script_5);
 }
 
 async fn handle_request(
     ur_address: String,
+    host_address: String,
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     mut g: r2r::ActionServerGoal<ExecuteScript::Action>,
@@ -165,7 +184,7 @@ async fn handle_request(
     };
 
     // Append stuff to the script...
-    let script_to_write = generate_ur_script(&g.goal.script);
+    let script_to_write = generate_ur_script(&g.goal.script, &host_address);
 
     println!("writing data to driver\n{}", script_to_write);
     write_stream.write_all(script_to_write.as_bytes()).await?;
@@ -283,6 +302,7 @@ async fn handle_request(
 
 async fn action_server(
     ur_address: String,
+    local_addr: watch::Receiver<Option<SocketAddr>>,
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     mut requests: impl Stream<Item = r2r::ActionServerGoalRequest<ExecuteScript::Action>> + Unpin,
@@ -294,6 +314,18 @@ async fn action_server(
     loop {
         match requests.next().await {
             Some(req) => {
+                let local_addr = local_addr.borrow().clone();
+                if local_addr.is_none() {
+                    println!(
+                        "Have not connected to robot yet, rejecting request with goal id: {}, script: '{}'",
+                        req.uuid, req.goal.script
+                    );
+                    req.reject().expect("could not reject goal");
+                    continue;
+                }
+                // Local addr is not none, safe to unwrap here.
+                let local_addr = local_addr.unwrap().ip().to_string();
+
                 if !driver_state.lock().unwrap().connected {
                     println!(
                         "No connection to the robot, rejecting request with goal id: {}, script: '{}'",
@@ -333,6 +365,7 @@ async fn action_server(
                 let task_driver_state = driver_state.clone();
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(task_ur_address,
+                                                local_addr,
                                                 task_driver_state,
                                                 task_dashboard_commands,
                                                 g,
@@ -846,15 +879,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_requests = node
         .create_action_server::<ExecuteScript::Action>("ur_script")?;
 
+    let (local_addr_sender, local_addr_receiver) = watch::channel(None);
+
     let shared_state_action = shared_state.clone();
     let action_task = action_server(ur_address.to_owned(),
+                                    local_addr_receiver.clone(),
                                     shared_state_action,
                                     tx_dashboard.clone(),
                                     server_requests);
 
     let task_shared_state = shared_state.clone();
 
-    let (local_addr_sender, local_addr_receiver) = watch::channel(None);
 
     let realtime_reader = realtime_reader(
         task_shared_state.clone(),
