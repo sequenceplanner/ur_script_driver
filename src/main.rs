@@ -1,5 +1,5 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
-use r2r::{Context, Node, ParameterValue, Publisher, ServiceRequest};
+use r2r::{Context, Node, ParameterValue, Publisher, ServiceRequest, QosProfile};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::net::SocketAddr;
@@ -805,7 +805,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Node::create(ros_ctx, "ur_script_driver", "")?;
 
     let ur_address = if let Some(ParameterValue::String(s)) = node.params
-        .lock().unwrap().get("ur_address").as_ref()
+        .lock().unwrap().get("ur_address").map(|p| &p.value)
     {
         s.to_owned()
     } else {
@@ -816,7 +816,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let prefix = if let Some(ParameterValue::String(s)) = node.params
-        .lock().unwrap().get("prefix").as_ref()
+        .lock().unwrap().get("prefix").map(|p| &p.value)
     {
         s.to_owned()
     } else {
@@ -837,7 +837,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         mpsc::channel::<(DashboardCommand, oneshot::Sender<bool>)>(10);
 
     let txd = tx_dashboard.clone();
-    let dashboard_service = node.create_service::<DBCommand::Service>("dashboard_command")?;
+    let dashboard_service = node.create_service::<DBCommand::Service>("dashboard_command", QosProfile::default())?;
 
     let dashboard_task = handle_dashboard_commands(dashboard_service, txd);
 

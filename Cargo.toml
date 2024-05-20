@@ -14,7 +14,7 @@ inherits = "release"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7.0", features = ["full"] }
-r2r = "0.7.1"
+r2r = "0.9.0"
 futures = "0.3.5"
 bytes = "0.5.4"
 hex = "0.4.2"
