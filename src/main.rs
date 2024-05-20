@@ -25,6 +25,7 @@ struct DriverState {
     // script executed successfully.
     goal_id: Option<String>,
     goal_sender: Option<oneshot::Sender<bool>>,
+    handshake_sender: Option<oneshot::Sender<bool>>,
     feedback_sender: Option<mpsc::Sender<String>>,
     robot_state: i32,
     program_state: i32,
@@ -57,6 +58,7 @@ impl DriverState {
             connected: false,
             goal_id: None,
             goal_sender: None,
+            handshake_sender: None,
             feedback_sender: None,
             robot_state: 0,
             program_state: 0,
@@ -183,100 +185,117 @@ async fn handle_request(
         }
     };
 
-    // Append stuff to the script...
+    // Append handshaking to the script.
     let script_to_write = generate_ur_script(&g.goal.script, &host_address);
+
+    let (handshake_sender, handshake_receiver) = oneshot::channel::<bool>();
+    let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
+    {
+        let mut ds = driver_state.lock().unwrap();
+        ds.goal_id = Some(g.uuid.to_string());
+        ds.goal_sender = Some(goal_sender);
+        ds.handshake_sender = Some(handshake_sender);
+        ds.feedback_sender = Some(feedback_sender);
+    }
 
     println!("writing data to driver\n{}", script_to_write);
     write_stream.write_all(script_to_write.as_bytes()).await?;
     write_stream.flush().await?;
 
-    let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
-
-    {
-        let mut ds = driver_state.lock().unwrap();
-        ds.goal_id = Some(g.uuid.to_string());
-        ds.goal_sender = Some(goal_sender);
-        ds.feedback_sender = Some(feedback_sender);
-    }
-
-    let publish_feedback_fut = async {
-        loop {
-            match feedback_receiver.recv().await {
-                Some(msg) => {
-                    let mut feedback_msg = ur_script_msgs::action::ExecuteScript::Feedback::default();
-                    feedback_msg.feedback = msg;
-                    g.publish_feedback(feedback_msg)?
-                },
-                None => {
-                    return Result::<(), Box<dyn std::error::Error>>::Ok(())
-                },
-            }
-        }
-    };
-
-    let nominal = Box::pin(async { futures::join!(goal_receiver, publish_feedback_fut) }).fuse();
-
+    // check handshake first.
     enum ResultType { ABORTED, CANCELED, SUCCEDED }
-    let (result_msg, result_type) = match future::select(nominal, cancel.next()).await {
-        Either::Left(((res, _), _cancel_stream)) => {
-            // success.
-            if let Ok(ok) = res {
-                println!("goal completed. result: {}", ok);
-                let result_msg = ExecuteScript::Result { ok };
-                // TODO: perhaps g.abort here if ok is false.
-                (result_msg, ResultType::SUCCEDED)
-            } else {
-                println!("future appears canceled, abort.");
-                let result_msg = ExecuteScript::Result { ok: false };
-                (result_msg, ResultType::ABORTED)
-            }
-        },
-        Either::Right((request, nominal)) => {
-            if let Some(request) = request {
-                println!("got cancel request: {}", request.uuid);
-                request.accept();
-
-                // this starts a race between completing
-                // the motion and cancelling via stopping.
-                // goal removal is done by the one that
-                // succeeds first.
-                let (sender, cancel_receiver) = oneshot::channel();
-                dashboard_commands
-                    .try_send((DashboardCommand::Stop, sender))
-                    .expect("could not send...");
-
-                match future::select(cancel_receiver, nominal).await {
-                    Either::Left((res, _nominal)) => {
-                        // cancelled using dashboard
-                        if let Ok(ok) = res {
-                            let result_msg = ExecuteScript::Result { ok };
-                            (result_msg, ResultType::CANCELED)
-                        } else {
-                            println!("cancel dashboard future appears canceled");
-                            let result_msg = ExecuteScript::Result { ok: false };
-                            (result_msg, ResultType::ABORTED)
-                        }
-                    },
-                    Either::Right(((res, _), _cancel_receiver)) => {
-                        // finished executing before cancellation was complete
-                        if let Ok(ok) = res {
-                            println!("goal completed. result: {}", ok);
-                            let result_msg = ExecuteScript::Result { ok };
-                            (result_msg, ResultType::SUCCEDED)
-                        } else {
-                            println!("finished executing but future is canceled.");
-                            let result_msg = ExecuteScript::Result { ok: false };
-                            (result_msg, ResultType::ABORTED)
-                        }
+    let (result_msg, result_type) = match timeout(Duration::from_millis(1000), handshake_receiver).await {
+        Ok(Ok(true)) => {
+            println!("HADNSHAKE OK, PERFORM NOMINAL");
+            let publish_feedback_fut = async {
+                loop {
+                    match feedback_receiver.recv().await {
+                        Some(msg) => {
+                            let mut feedback_msg = ur_script_msgs::action::ExecuteScript::Feedback::default();
+                            feedback_msg.feedback = msg;
+                            g.publish_feedback(feedback_msg)?
+                        },
+                        None => {
+                            return Result::<(), Box<dyn std::error::Error>>::Ok(())
+                        },
                     }
                 }
-            } else {
-                let result_msg = ExecuteScript::Result { ok: false };
-                println!("got cancel but sender seem dropped");
-                (result_msg, ResultType::ABORTED)
+            };
+            let nominal = Box::pin(async { futures::join!(goal_receiver, publish_feedback_fut) }).fuse();
+
+            match future::select(nominal, cancel.next()).await {
+                Either::Left(((res, _), _cancel_stream)) => {
+                    // success.
+                    if let Ok(ok) = res {
+                        println!("goal completed. result: {}", ok);
+                        let result_msg = ExecuteScript::Result { ok };
+                        // TODO: perhaps g.abort here if ok is false.
+                        (result_msg, ResultType::SUCCEDED)
+                    } else {
+                        println!("future appears canceled, abort.");
+                        let result_msg = ExecuteScript::Result { ok: false };
+                        (result_msg, ResultType::ABORTED)
+                    }
+                },
+                Either::Right((request, nominal)) => {
+                    if let Some(request) = request {
+                        println!("got cancel request: {}", request.uuid);
+                        request.accept();
+
+                        // this starts a race between completing
+                        // the motion and cancelling via stopping.
+                        // goal removal is done by the one that
+                        // succeeds first.
+                        let (sender, cancel_receiver) = oneshot::channel();
+                        dashboard_commands
+                            .try_send((DashboardCommand::Stop, sender))
+                            .expect("could not send...");
+
+                        match future::select(cancel_receiver, nominal).await {
+                            Either::Left((res, _nominal)) => {
+                                // cancelled using dashboard
+                                if let Ok(ok) = res {
+                                    let result_msg = ExecuteScript::Result { ok };
+                                    (result_msg, ResultType::CANCELED)
+                                } else {
+                                    println!("cancel dashboard future appears canceled");
+                                    let result_msg = ExecuteScript::Result { ok: false };
+                                    (result_msg, ResultType::ABORTED)
+                                }
+                            },
+                            Either::Right(((res, _), _cancel_receiver)) => {
+                                // finished executing before cancellation was complete
+                                if let Ok(ok) = res {
+                                    println!("goal completed. result: {}", ok);
+                                    let result_msg = ExecuteScript::Result { ok };
+                                    (result_msg, ResultType::SUCCEDED)
+                                } else {
+                                    println!("finished executing but future is canceled.");
+                                    let result_msg = ExecuteScript::Result { ok: false };
+                                    (result_msg, ResultType::ABORTED)
+                                }
+                            }
+                        }
+                    } else {
+                        let result_msg = ExecuteScript::Result { ok: false };
+                        println!("got cancel but sender seem dropped");
+                        (result_msg, ResultType::ABORTED)
+                    }
+                }
             }
-        }
+        },
+        Ok(_) => {
+            println!("HANDSHAKE FAILURE, ABORTING");
+            let result_msg = ExecuteScript::Result { ok: false };
+            (result_msg, ResultType::ABORTED)
+        },
+        Err(_) => {
+            println!("HADNSHAKE TIMEOUT, ABORTING");
+            let result_msg = ExecuteScript::Result { ok: false };
+            (result_msg, ResultType::ABORTED)
+        },
     };
+
 
     match result_type {
         ResultType::ABORTED => {
@@ -295,6 +314,8 @@ async fn handle_request(
         let mut ds = driver_state.lock().unwrap();
         ds.goal_id = None;
         ds.goal_sender = None;
+        ds.handshake_sender = None;
+        ds.feedback_sender = None;
     }
 
     Ok(())
@@ -432,9 +453,18 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
         // Check that the UR-script identifies with the correct goal id.
         // Otherwise we signal failure.
 
-        let (goal_id, feedback_sender) = {
-            let ds = driver_state.lock().unwrap();
-            (ds.goal_id.clone(), ds.feedback_sender.clone())
+        let (goal_id,
+             handshake_sender,
+             feedback_sender) = {
+            let mut ds = driver_state.lock().unwrap();
+
+            if ds.handshake_sender.is_none() {
+                println!("SHOULD NOT HAPPEN, DROPPING STREAM");
+                continue;
+            }
+            let hss = ds.handshake_sender.take().unwrap();
+
+            (ds.goal_id.clone(), hss, ds.feedback_sender.clone())
         };
         if goal_id.is_none() {
             println!("SHOULD NOT HAPPEN, DROPPING STREAM");
@@ -453,47 +483,20 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
         // send goal id to ur script for handshaking.
         lines.send(&goal_id).await?;
 
-
-        // read back the next line which should be the same goal id.
-        // if there's been more than 1000 millis without the program
-        // completing the handshaking, abort this request.
-        // (should also stop using dashboard server just in case.)
-        match timeout(Duration::from_millis(1000), lines.next()).await {
-            Err(_) => {
-                let mut ds = driver_state.lock().unwrap();
-                if let Some(goal_sender) = ds.goal_sender.take() {
-                    println!("handshake not performed in time, stopping!");
-                    goal_sender.send(false).expect("goal receiver dropped");
-                }
-                let (sender, cancel_receiver) = oneshot::channel();
-                dashboard_commands
-                    .try_send((DashboardCommand::Stop, sender))
-                    .expect("could not send...");
-                if let Err(e) = cancel_receiver.await {
-                    println!("No response from dashboard server {e}");
-                }
-                continue;
-            },
-            Ok(Some(Ok(s))) if s == goal_id => {
+        // read one line.
+        let line = lines.next().await;
+        match line {
+            Some(Ok(s)) if s == goal_id => {
                 println!("got GO with correct GOAL ID, start UR script.");
-            },
-            Ok(_) => {
-                println!("got GO with incorrect GOAL ID, SHOULD NOT HAPPEN");
-                println!("Stopping execution via dashboard server");
-                // TODO: handle failure here by force stopping the ur script.
-                // can use dashboard server for that.
-                let (sender, cancel_receiver) = oneshot::channel();
-                dashboard_commands
-                    .try_send((DashboardCommand::Stop, sender))
-                    .expect("could not send...");
-                if let Err(e) = cancel_receiver.await {
-                    println!("No response from dashboard server {e}");
-                }
-                continue;
+                handshake_sender.send(true).expect("Could not send handshake result");
             }
-        };
+            _ => {
+                println!("got GO with incorrect GOAL ID, SHOULD NOT HAPPEN");
+                handshake_sender.send(false).expect("Could not send handshake result");
+            }
+        }
 
-        let message = format!("Handshake complete, running script");
+        let message = format!("Handshake complete, script should be running.");
         if let Err(e) = feedback_sender.send(message).await {
             println!("could not send feedback message: {}", e);
         }
