@@ -35,7 +35,7 @@ end
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "testnode", "")?;
     let client = node.create_action_client::<ExecuteScript::Action>("/ur_script")?;
-    let action_server_available = node.is_available(&client)?;
+    let action_server_available = r2r::Node::is_available(&client)?;
 
     tokio::spawn(async move {
         println!("waiting for action service...");

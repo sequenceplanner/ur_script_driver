@@ -1,5 +1,6 @@
 use r2r::{sensor_msgs, std_msgs, ur_script_msgs};
 use r2r::{Context, Node, ParameterValue, Publisher, ServiceRequest, QosProfile};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::net::SocketAddr;
@@ -552,13 +553,18 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
 async fn realtime_reader(
     driver_state: Arc<Mutex<DriverState>>,
     ur_address: String,
+    override_host_address: Option<String>,
     local_addr_sender: watch::Sender<Option<SocketAddr>>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut size_bytes = [0u8; 4];
 
     let mut stream = connect_loop(&ur_address).await;
 
-    let local_addr = stream.local_addr()?;
+    let local_addr = if let Some(s) = &override_host_address {
+        SocketAddr::from_str(&format!("{}:0", s))?
+    } else {
+        stream.local_addr()?
+    };
     local_addr_sender.send(Some(local_addr))?;
 
     driver_state.lock().unwrap().connected = true;
@@ -845,11 +851,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         s.to_owned()
     } else {
-        // "192.168.2.125".to_owned()
-        // "192.168.100.55".to_owned()
-        // "192.168.100.12".to_owned()
-        "192.168.1.31".to_owned()
+        "localhost".to_owned()
     };
+
+    let override_host_address: Option<String> = node.params.lock().unwrap()
+        .get("override_host_address").and_then(|k| {
+            if let ParameterValue::String(s) = &k.value {
+                Some(s.clone())
+            } else { None }
+        });
 
     let prefix = if let Some(ParameterValue::String(s)) = node.params
         .lock().unwrap().get("prefix").map(|p| &p.value)
@@ -897,6 +907,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let realtime_reader = realtime_reader(
         task_shared_state.clone(),
         ur_address.to_owned(),
+        override_host_address,
         local_addr_sender,
     );
     let state_publisher =
