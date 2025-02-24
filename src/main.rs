@@ -489,11 +489,15 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
         match line {
             Some(Ok(s)) if s == goal_id => {
                 println!("got GO with correct GOAL ID, start UR script.");
-                handshake_sender.send(true).expect("Could not send handshake result");
+                if let Err(e) = handshake_sender.send(true) {
+                    println!("could not send handshake result: {}", e);
+                }
             }
             _ => {
                 println!("got GO with incorrect GOAL ID, SHOULD NOT HAPPEN");
-                handshake_sender.send(false).expect("Could not send handshake result");
+                if let Err(e) = handshake_sender.send(false) {
+                    println!("could not send handshake result: {}", e);
+                }
             }
         }
 
