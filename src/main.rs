@@ -325,6 +325,7 @@ async fn handle_request(
 async fn action_server(
     ur_address: String,
     local_addr: watch::Receiver<Option<SocketAddr>>,
+    override_host_addr: Option<String>,
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     mut requests: impl Stream<Item = r2r::ActionServerGoalRequest<ExecuteScript::Action>> + Unpin,
@@ -385,9 +386,14 @@ async fn action_server(
                 let task_ur_address = ur_address.clone();
                 let task_dashboard_commands = dashboard_commands.clone();
                 let task_driver_state = driver_state.clone();
+                let connect_back_to = if let Some(s) = &override_host_addr {
+                    s.clone()
+                } else {
+                    local_addr
+                };
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(task_ur_address,
-                                                local_addr,
+                                                connect_back_to,
                                                 task_driver_state,
                                                 task_dashboard_commands,
                                                 g,
@@ -564,11 +570,12 @@ async fn realtime_reader(
 
     let mut stream = connect_loop(&ur_address).await;
 
-    let local_addr = if let Some(s) = &override_host_address {
-        SocketAddr::from_str(&format!("{}:0", s))?
-    } else {
-        stream.local_addr()?
-    };
+    // let local_addr = if let Some(s) = &override_host_address {
+    //     SocketAddr::from_str(&format!("{}:0", s))?
+    // } else {
+    //     stream.local_addr()?
+    // };
+    let local_addr = stream.local_addr()?;
     local_addr_sender.send(Some(local_addr))?;
 
     driver_state.lock().unwrap().connected = true;
@@ -901,6 +908,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_state_action = shared_state.clone();
     let action_task = action_server(ur_address.to_owned(),
                                     local_addr_receiver.clone(),
+                                    override_host_address.clone(),
                                     shared_state_action,
                                     tx_dashboard.clone(),
                                     server_requests);
