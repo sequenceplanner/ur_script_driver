@@ -205,7 +205,7 @@ async fn handle_request(
 
     // check handshake first.
     enum ResultType { ABORTED, CANCELED, SUCCEDED }
-    let (result_msg, result_type) = match timeout(Duration::from_millis(1000), handshake_receiver).await {
+    let (result_msg, result_type) = match timeout(Duration::from_millis(5000), handshake_receiver).await {
         Ok(Ok(true)) => {
             println!("HADNSHAKE OK, PERFORM NOMINAL");
             let publish_feedback_fut = async {
