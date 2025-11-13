@@ -50,6 +50,7 @@ struct DriverState {
     output_bit5: bool,
     output_bit6: bool,
     output_bit7: bool,
+    forces: Vec<f64>
 }
 
 impl DriverState {
@@ -83,6 +84,7 @@ impl DriverState {
             output_bit5: false,
             output_bit6: false,
             output_bit7: false,
+            forces: vec![]
         }
     }
 }
@@ -430,7 +432,7 @@ async fn connect_loop(address: &str) -> TcpStream {
 
 
 async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
-                       dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
+                       _dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
                        mut local_addr: watch::Receiver<Option<SocketAddr>>) -> Result<(), Box<dyn std::error::Error>> {
     let mut addr = None;
     while addr.is_none() {
@@ -543,7 +545,7 @@ async fn socket_server(driver_state: Arc<Mutex<DriverState>>,
                 },
                 _ => {
                     // TODO: handle failure here...
-                    println!("Socked connection closed, dropping feedback sender.");
+                    println!("Socket connection closed, dropping feedback sender.");
                     let mut ds = driver_state.lock().unwrap();
                     ds.feedback_sender = None;
 
@@ -649,6 +651,7 @@ async fn realtime_reader(
                 let mut ds = driver_state.lock().unwrap();
                 (*ds).joint_values = joints;
                 (*ds).joint_speeds = speeds;
+                (*ds).forces = forces;
                 (*ds).robot_state = robot_state.clone();
                 (*ds).program_state = program_state.clone();
                 (*ds).input_bit0 = digital_inputs & 1 == 1;
@@ -718,6 +721,7 @@ async fn state_publisher(
             let measured = ur_script_msgs::msg::Measured {
                 robot_state: (*ds).robot_state,
                 program_state: (*ds).program_state,
+                forces: (*ds).forces.clone(),
 
                 in0: (*ds).input_bit0,
                 in1: (*ds).input_bit1,
